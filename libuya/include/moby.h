@@ -692,7 +692,7 @@ typedef struct MupltiplayerConfig { // 0x3a0
 } MultiplayerConfig_t;
 
 
-struct typedef M6695_BoltCrank { // 0x60
+typedef struct M6695_BoltCrank { // 0x60
 /* 0x00 */ float bias;
 /* 0x04 */ float biasBackup;
 /* 0x08 */ char unk_04[0xc]; 
@@ -816,3 +816,4 @@ void flagPickup(Moby* flagMoby, int playerIdx);
 void flagUpdate(Moby*, int a1);
 
 #endif // _LIBUYA_MOBY_H_
+

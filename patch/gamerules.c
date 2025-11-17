@@ -30,6 +30,8 @@
 #include "include/cheats.h"
 #include "interop/gamerules.h"
 
+#define DOMINATION_NODE_Z               (10.0f)
+
 extern PatchConfig_t config;
 extern PatchGameConfig_t gameConfig;
 extern PatchPatches_t patched;
@@ -128,6 +130,8 @@ u32 onGameplayLoad(void* a0, long a1)
 
 	if (gameConfig.grDestructableBridges)
 		onGameplayLoad_destructableBridges(gameplay);
+
+	onGameplayLoad_adjustSiegePadTies(gameplay, DOMINATION_NODE_Z);
 
 	// run base
 	((void (*)(void*, long))Gameplay_Func)(a0, a1);

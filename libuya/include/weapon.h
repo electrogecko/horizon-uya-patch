@@ -76,8 +76,8 @@ typedef struct Weapons {
             char Wrench;
             char Swingshot;
             char Holo;
-        }
-    }
+        };
+    };
 } Weapons;
 
 struct tNW_GadgetEventMessage { // 0x24
@@ -146,3 +146,4 @@ int weaponIsEnabled(int weaponId);
 TweakersGravityBomb_t * weaponGravityBombTweakers(void);
 
 #endif // _LIBUYA_WEAPON_H_
+

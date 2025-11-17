@@ -521,6 +521,41 @@ void onGameplayLoad_disableMoby(GameplayHeaderDef_t * gameplay, int mobyId, int 
 	}
 }
 
+#define SIEGE_PAD_TIE_OCLASS          (0x1F1F)
+#define TIE_INSTANCE_ENTRY_SIZE       (0xE0)
+
+typedef struct TieInstanceTableHeader {
+	s32 Count;
+	s32 Pad[3];
+} TieInstanceTableHeader_t;
+
+typedef struct TieInstanceEntry {
+	s32 OClass;
+	s32 DrawDistance;
+	s32 Pad8;
+	s32 OcclusionIndex;
+	float Matrix[4][4];
+	u8 Reserved[TIE_INSTANCE_ENTRY_SIZE - 0x50];
+} TieInstanceEntry_t;
+
+void onGameplayLoad_adjustSiegePadTies(GameplayHeaderDef_t * gameplay, float targetZ)
+{
+	if (!gameplay || !gameplay->TieInstancesOffset)
+		return;
+
+	TieInstanceTableHeader_t * header = (TieInstanceTableHeader_t*)((u8*)gameplay + gameplay->TieInstancesOffset);
+	int count = header->Count;
+	if (count <= 0 || count > 4096)
+		return;
+
+	TieInstanceEntry_t * entries = (TieInstanceEntry_t*)((u8*)header + sizeof(TieInstanceTableHeader_t));
+	int i;
+	for (i = 0; i < count; ++i) {
+		if (entries[i].OClass == SIEGE_PAD_TIE_OCLASS)
+			entries[i].Matrix[3][2] = targetZ;
+	}
+}
+
 /*
  * NAME :		keepBaseHealthPadActive
  * DESCRIPTION :
