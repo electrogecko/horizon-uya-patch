@@ -32,6 +32,7 @@ typedef struct PatchGameConfig {
   // Maps
   char isCustomMap;
   char customModeId;
+  char kothScoreLimit;
 
   // Game Rules
   char grRadarBlipsDistance;
