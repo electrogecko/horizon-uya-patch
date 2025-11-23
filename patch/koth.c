@@ -18,6 +18,8 @@
 #include "messageid.h"
 #include "include/config.h"
 
+extern PatchGameConfig_t gameConfig;
+
 #define KOTH_MAX_HILLS         (8)
 #define KOTH_RING_RADIUS       (10.0f)
 #define KOTH_RING_HEIGHT       (1.0f)
@@ -33,6 +35,7 @@ static int hillCount = 0;
 static int initialized = 0;
 static int handlerInstalled = 0;
 static int nextScoreTickTime = 0;
+static int gameOverTriggered = 0;
 static int kothScores[GAME_MAX_PLAYERS];
 static int lastBroadcastScore[GAME_MAX_PLAYERS];
 
@@ -137,6 +140,105 @@ static void updateScores(void)
             if (kothScores[p->mpIndex] != lastBroadcastScore[p->mpIndex])
                 broadcastScore(p->mpIndex);
         }
+    }
+}
+
+static int kothGetScoreLimit(void)
+{
+    int setting = (int)gameConfig.kothScoreLimit;
+    if (setting <= 0)
+        return 0;
+
+    return setting * 50;
+}
+
+static int kothFindLeader(int *outScore, int *outTie)
+{
+    GameSettings *gs = gameGetSettings();
+    if (!gs)
+        return -1;
+
+    Player **players = playerGetAll();
+    char seen[GAME_MAX_PLAYERS];
+    int leaderIdx = -1;
+    int leaderScore = 0;
+    int isTie = 0;
+    int i;
+
+    memset(seen, 0, sizeof(seen));
+    for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
+        Player *p = players[i];
+        if (!p)
+            continue;
+
+        int idx = p->mpIndex;
+        if (idx < 0 || idx >= GAME_MAX_PLAYERS)
+            continue;
+        if (seen[idx])
+            continue;
+        if (!gs->PlayerNames[idx][0])
+            continue;
+
+        seen[idx] = 1;
+        int score = kothScores[idx];
+        if (leaderIdx < 0 || score > leaderScore) {
+            leaderIdx = idx;
+            leaderScore = score;
+            isTie = 0;
+        } else if (score == leaderScore) {
+            isTie = 1;
+        }
+    }
+
+    if (outScore)
+        *outScore = leaderScore;
+    if (outTie)
+        *outTie = isTie;
+    return leaderIdx;
+}
+
+static void kothDeclareWinner(int winnerIdx, int reason)
+{
+    GameSettings *gs = gameGetSettings();
+    GameOptions *go = gameGetOptions();
+    if (!gs || !go)
+        return;
+
+    int useTeams = go->GameFlags.MultiplayerGameFlags.Teams;
+    int winnerId = useTeams ? gs->PlayerTeams[winnerIdx] : winnerIdx;
+    if (winnerId < 0)
+        return;
+
+    gameSetWinner(winnerId, useTeams);
+    gameEnd(reason);
+    gameOverTriggered = 1;
+}
+
+static void kothCheckVictory(void)
+{
+    if (gameOverTriggered || gameHasEnded())
+        return;
+    if (!gameAmIHost())
+        return;
+
+    GameData *gd = gameGetData();
+    if (!gd)
+        return;
+
+    int leaderScore = 0;
+    int isTie = 0;
+    int leaderIdx = kothFindLeader(&leaderScore, &isTie);
+    if (leaderIdx < 0)
+        return;
+
+    int scoreLimit = kothGetScoreLimit();
+    if (scoreLimit > 0 && leaderScore >= scoreLimit && !isTie) {
+        kothDeclareWinner(leaderIdx, GAME_END_TEAM_WIN);
+        return;
+    }
+
+    if (gd->timeEnd > 0 && gameGetTime() >= gd->timeEnd && !isTie) {
+        kothDeclareWinner(leaderIdx, GAME_END_TIME_UP);
     }
 }
 
@@ -331,6 +433,7 @@ void kothReset(void)
     handlerInstalled = 0;
     hillCount = 0;
     nextScoreTickTime = 0;
+    gameOverTriggered = 0;
     memset(hills, 0, sizeof(hills));
     memset(kothScores, 0, sizeof(kothScores));
     memset(lastBroadcastScore, 0, sizeof(lastBroadcastScore));
@@ -362,4 +465,6 @@ void kothTick(void)
         updateScores();
         nextScoreTickTime = gameTime + KOTH_SCORE_TICK_MS;
     }
+
+    kothCheckVictory();
 }

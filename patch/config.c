@@ -113,6 +113,7 @@ void menuStateHandler_DM(TabElem_t* tab, MenuElem_t* element, int* state);
 void menuStateHandler_CTFandSiege(TabElem_t* tab, MenuElem_t* element, int* state);
 void menuStateHandler_Nodes(TabElem_t* tab, MenuElem_t* element, int* state);
 void menuStateHandler_Survivor(TabElem_t* tab, MenuElem_t* element, int* state);
+void menuStateHandler_KOTH(TabElem_t* tab, MenuElem_t* element, int* state);
 void menuStateHandler_Default(TabElem_t* tab, MenuElem_t* element, int* state);
 void menuStateHandler_VoteToEndStateHandler(TabElem_t* tab, MenuElem_t* element, int* state);
 void menuStateHandler_DisabledInGame(TabElem_t* tab, MenuElem_t* element, int* state);
@@ -295,6 +296,13 @@ const char* CustomModeShortNames[] = {
   [CUSTOM_MODE_KOTH] "KOTH"
 };
 
+MenuElem_ListData_t dataKothScoreLimit = {
+    .value = &gameConfig.kothScoreLimit,
+    .stateHandler = menuStateHandler_KOTH,
+    .count = 11,
+    .items = { "Off", "50", "100", "150", "200", "250", "300", "350", "400", "450", "500" }
+};
+
 MenuElem_ListData_t dataV2_Setting = {
     .value = &gameConfig.grV2s,
     .stateHandler = NULL,
@@ -475,6 +483,7 @@ MenuElem_t menuElementsGameSettings[] = {
   // { "Game Settings", labelActionHandler, menuLabelStateHandler, (void*)LABELTYPE_HEADER },
   // { "Map Override", listActionHandler, menuStateAlwaysEnabledHandler, &dataCustomMaps, "Play on any of the custom maps from the Horizon Map Pack. Visit https://rac-horizon.com to download the map pack." },
   { "Gamemode Override", gmOverrideListActionHandler, menuStateHandler_GameModeOverride, &dataCustomModes, "Change to one of the Horizon Custom Gamemodes." },
+  { "KOTH Points", listActionHandler, menuStateHandler_KOTH, &dataKothScoreLimit, "Points needed to win King of the Hill (0 = disabled, uses timer if set)." },
   { "Preset", listActionHandler, menuStateAlwaysEnabledHandler, &dataGameConfigPreset, "Select one of the preconfigured game rule presets or manually set the custom game rules below." },
 
   { "Game Rules", labelActionHandler, menuLabelStateHandler, (void*)LABELTYPE_HEADER },
@@ -714,6 +723,16 @@ void menuStateHandler_DM(TabElem_t* tab, MenuElem_t* element, int* state)
   GameSettings * gs = gameGetSettings();
 
   if (!gs || gs->GameType != GAMETYPE_DM)
+    *state = ELEMENT_HIDDEN;
+  else if (preset)
+    *state = ELEMENT_SELECTABLE | ELEMENT_VISIBLE;
+  else
+    *state = ELEMENT_SELECTABLE | ELEMENT_VISIBLE | ELEMENT_EDITABLE;
+}
+
+void menuStateHandler_KOTH(TabElem_t* tab, MenuElem_t* element, int* state)
+{
+  if (gameConfig.customModeId != CUSTOM_MODE_KOTH)
     *state = ELEMENT_HIDDEN;
   else if (preset)
     *state = ELEMENT_SELECTABLE | ELEMENT_VISIBLE;
