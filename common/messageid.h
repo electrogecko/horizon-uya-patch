@@ -151,6 +151,11 @@ enum CustomMessageId
     CUSTOM_MSG_PLAYER_SYNC_STATE_UPDATE = 27,
 
     /*
+     * Sent every second to sync KOTH personal score.
+     */
+    CUSTOM_MSG_ID_KOTH_SCORE_UPDATE = 28,
+
+    /*
      * Start of custom message ids reserved for custom game modes.
      */
     CUSTOM_MSG_ID_GAME_MODE_START = 100,
@@ -199,5 +204,11 @@ typedef struct DateResponse {
   char Minute;
   char Second;
 } DateResponse_t;
+
+typedef struct KothScoreUpdate {
+  char PlayerIdx;
+  short Score;
+  char Padding;
+} KothScoreUpdate_t;
 
 #endif // _MESSAGEID_H_

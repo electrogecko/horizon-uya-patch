@@ -29,6 +29,7 @@
 #include "include/config.h"
 #include "include/cheats.h"
 #include "interop/gamerules.h"
+#include "include/koth.h"
 
 #define SIEGE_PAD_TIE_Z (10.0f)
 
@@ -166,6 +167,8 @@ void grInitialize(GameSettings *gameSettings, GameOptions *gameOptions)
 	siegeGameOver = 0;
 	maxNodeCount = -1;
 	GameRulesInitialized = 1;
+
+	kothReset();
 }
 
 /*
@@ -257,6 +260,9 @@ void grGameStart(void)
 
 	if (gameConfig.grSiegeDominationNodes)
 		domination();
+
+	if (gameConfig.customModeId == CUSTOM_MODE_KOTH)
+		kothTick();
 
 	FirstPass = 0;
 }

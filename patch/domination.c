@@ -351,7 +351,6 @@ int baseCheckIfInside(VECTOR basePos, VECTOR playerPos)
 void basePlayerUpdate(Moby *this)
 {
     DominationBase_t *pvar = (DominationBase_t*)this->pVar;
-    GameSettings *gs = gameGetSettings();
     int i, j;
     int localPlayerInside = 0;
     int localPlayerColor = -1;

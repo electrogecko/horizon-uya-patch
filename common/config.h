@@ -126,6 +126,7 @@ enum CUSTOM_MODE_ID {
   // CUSTOM_MODE_INFECTED,
   // CUSTOM_MODE_JUGGERNAUGHT,
   CUSTOM_MODE_MIDFLAG = 1,
+  CUSTOM_MODE_KOTH = 2,
   // always at the end to indicate how many items there are
   CUSTOM_MODE_COUNT
 };
