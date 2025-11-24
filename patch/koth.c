@@ -18,6 +18,10 @@
 #include "messageid.h"
 #include "include/config.h"
 
+#ifndef TEAM_MAX
+#define TEAM_MAX 8
+#endif
+
 extern PatchGameConfig_t gameConfig;
 
 #define KOTH_MAX_HILLS         (8)
@@ -77,6 +81,15 @@ static float clampf(float value, float min, float max)
     if (value < min) return min;
     if (value > max) return max;
     return value;
+}
+
+static int kothGetActiveHillIndex(void);
+static int kothUseTeams(void);
+
+static int kothUseTeams(void)
+{
+    GameOptions *go = gameGetOptions();
+    return go && go->GameFlags.MultiplayerGameFlags.Teams;
 }
 
 static int kothGetActiveHillIndex(void);
@@ -213,35 +226,71 @@ static int kothFindLeader(int *outScore, int *outTie)
     if (!gs)
         return -1;
 
-    Player **players = playerGetAll();
-    char seen[GAME_MAX_PLAYERS];
+    int useTeams = kothUseTeams();
     int leaderIdx = -1;
     int leaderScore = 0;
     int isTie = 0;
-    int i;
 
-    memset(seen, 0, sizeof(seen));
-    for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
-        Player *p = players[i];
-        if (!p)
-            continue;
+    if (useTeams) {
+        int teamScores[TEAM_MAX];
+        char teamSeen[TEAM_MAX];
+        memset(teamScores, 0, sizeof(teamScores));
+        memset(teamSeen, 0, sizeof(teamSeen));
 
-        int idx = p->mpIndex;
-        if (idx < 0 || idx >= GAME_MAX_PLAYERS)
-            continue;
-        if (seen[idx])
-            continue;
-        if (!gs->PlayerNames[idx][0])
-            continue;
+        Player **players = playerGetAll();
+        int i;
+        for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
+            Player *p = players[i];
+            if (!p)
+                continue;
+            int team = gs->PlayerTeams[p->mpIndex];
+            if (team < 0 || team >= TEAM_MAX)
+                continue;
+            teamSeen[team] = 1;
+            teamScores[team] += kothScores[p->mpIndex];
+        }
 
-        seen[idx] = 1;
-        int score = kothScores[idx];
-        if (leaderIdx < 0 || score > leaderScore) {
-            leaderIdx = idx;
-            leaderScore = score;
-            isTie = 0;
-        } else if (score == leaderScore) {
-            isTie = 1;
+        int t;
+        for (t = 0; t < TEAM_MAX; ++t) {
+            if (!teamSeen[t])
+                continue;
+            int score = teamScores[t];
+            if (leaderIdx < 0 || score > leaderScore) {
+                leaderIdx = t;
+                leaderScore = score;
+                isTie = 0;
+            } else if (score == leaderScore) {
+                isTie = 1;
+            }
+        }
+    } else {
+        Player **players = playerGetAll();
+        char seen[GAME_MAX_PLAYERS];
+        int i;
+
+        memset(seen, 0, sizeof(seen));
+        for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
+            Player *p = players[i];
+            if (!p)
+                continue;
+
+            int idx = p->mpIndex;
+            if (idx < 0 || idx >= GAME_MAX_PLAYERS)
+                continue;
+            if (seen[idx])
+                continue;
+            if (!gs->PlayerNames[idx][0])
+                continue;
+
+            seen[idx] = 1;
+            int score = kothScores[idx];
+            if (leaderIdx < 0 || score > leaderScore) {
+                leaderIdx = idx;
+                leaderScore = score;
+                isTie = 0;
+            } else if (score == leaderScore) {
+                isTie = 1;
+            }
         }
     }
 
@@ -261,7 +310,14 @@ static int kothSetWinnerFields(int winnerIdx, int reason, int endGame)
         return 0;
 
     int useTeams = go->GameFlags.MultiplayerGameFlags.Teams;
-    int winnerId = useTeams ? gs->PlayerTeams[winnerIdx] : winnerIdx;
+    int winnerId = winnerIdx;
+    if (useTeams) {
+        if (winnerId < 0 || winnerId >= TEAM_MAX)
+            return 0;
+    } else {
+        if (winnerId < 0 || winnerId >= GAME_MAX_PLAYERS)
+            return 0;
+    }
     if (winnerId < 0)
         return 0;
 
@@ -496,41 +552,72 @@ static void drawHud(void)
     if (!gs)
         return;
 
-    // gather entries
+    int useTeams = kothUseTeams();
+
     typedef struct {
         int idx;
         int score;
     } Entry;
-    Entry entries[GAME_MAX_PLAYERS];
-    char seen[GAME_MAX_PLAYERS];
+    Entry entries[GAME_MAX_PLAYERS > TEAM_MAX ? GAME_MAX_PLAYERS : TEAM_MAX];
     int count = 0;
 
-    memset(seen, 0, sizeof(seen));
-    Player **players = playerGetAll();
-    int i;
-    for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
-        Player *p = players[i];
-        if (!p)
-            continue;
+    if (useTeams) {
+        int teamScores[TEAM_MAX];
+        char teamSeen[TEAM_MAX];
+        memset(teamScores, 0, sizeof(teamScores));
+        memset(teamSeen, 0, sizeof(teamSeen));
 
-        int idx = p->mpIndex;
-        if (idx < 0 || idx >= GAME_MAX_PLAYERS)
-            continue;
-        if (seen[idx])
-            continue;
-        if (!gs->PlayerNames[idx][0])
-            continue;
+        Player **players = playerGetAll();
+        int i;
+        for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
+            Player *p = players[i];
+            if (!p)
+                continue;
+            int team = gs->PlayerTeams[p->mpIndex];
+            if (team < 0 || team >= TEAM_MAX)
+                continue;
+            teamSeen[team] = 1;
+            teamScores[team] += kothScores[p->mpIndex];
+        }
 
-        seen[idx] = 1;
-        entries[count].idx = idx;
-        entries[count].score = kothScores[idx];
-        ++count;
+        int t;
+        for (t = 0; t < TEAM_MAX; ++t) {
+            if (!teamSeen[t])
+                continue;
+            entries[count].idx = t;
+            entries[count].score = teamScores[t];
+            ++count;
+        }
+    } else {
+        char seen[GAME_MAX_PLAYERS];
+        memset(seen, 0, sizeof(seen));
+        Player **players = playerGetAll();
+        int i;
+        for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
+            Player *p = players[i];
+            if (!p)
+                continue;
+
+            int idx = p->mpIndex;
+            if (idx < 0 || idx >= GAME_MAX_PLAYERS)
+                continue;
+            if (seen[idx])
+                continue;
+            if (!gs->PlayerNames[idx][0])
+                continue;
+
+            seen[idx] = 1;
+            entries[count].idx = idx;
+            entries[count].score = kothScores[idx];
+            ++count;
+        }
     }
 
     // sort desc by score (small N)
     int swapped = 1;
     while (swapped) {
         swapped = 0;
+        int i;
         for (i = 0; i < count - 1; ++i) {
             if (entries[i].score < entries[i + 1].score) {
                 Entry tmp = entries[i];
@@ -546,12 +633,23 @@ static void drawHud(void)
     float lineH = 16.0f;
     gfxScreenSpaceText(startX, startY - lineH, 1, 1, 0x80FFFFFF, "KOTH", -1, TEXT_ALIGN_TOPLEFT, FONT_BOLD);
 
+    int i;
     for (i = 0; i < count; ++i) {
         int idx = entries[i].idx;
         char line[64];
-        snprintf(line, sizeof(line), "%s: %d", gs->PlayerNames[idx], entries[i].score);
-        int team = gs->PlayerTeams[idx];
-        u32 color = (0x80 << 24) | ((team >= 0 && team < 8) ? TEAM_COLORS[team] : 0x00FFFFFF);
+        u32 color = 0x80FFFFFF;
+        if (useTeams) {
+            static const char *teamNames[TEAM_MAX] = {
+                "Blue", "Red", "Green", "Orange", "Yellow", "Purple", "Aqua", "Pink"
+            };
+            const char *name = (idx >= 0 && idx < TEAM_MAX) ? teamNames[idx] : "Team";
+            snprintf(line, sizeof(line), "%s: %d", name, entries[i].score);
+            color = (0x80 << 24) | ((idx >= 0 && idx < TEAM_MAX) ? TEAM_COLORS[idx] : 0x00FFFFFF);
+        } else {
+            snprintf(line, sizeof(line), "%s: %d", gs->PlayerNames[idx], entries[i].score);
+            int team = gs->PlayerTeams[idx];
+            color = (0x80 << 24) | ((team >= 0 && team < 8) ? TEAM_COLORS[team] : 0x00FFFFFF);
+        }
         gfxScreenSpaceText(startX, startY + (i * lineH), 1, 1, color, line, -1, TEXT_ALIGN_TOPLEFT, FONT_DEFAULT);
     }
 }
