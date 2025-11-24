@@ -28,6 +28,9 @@ extern PatchGameConfig_t gameConfig;
 
 typedef struct KothHill {
     VECTOR position;
+    Moby *moby;
+    Moby *drawMoby;
+    float scroll;
 } KothHill_t;
 
 static KothHill_t hills[KOTH_MAX_HILLS];
@@ -84,6 +87,17 @@ static void scanHillsOnce(void)
         if (moby->oClass == MOBY_ID_SIEGE_NODE) {
             vector_copy(hills[hillCount].position, moby->position);
             hills[hillCount].position[3] = 1;
+            hills[hillCount].moby = moby;
+            hills[hillCount].scroll = 0;
+            hills[hillCount].drawMoby = mobySpawn(0x1c0d, 0);
+            if (hills[hillCount].drawMoby) {
+                vector_copy(hills[hillCount].drawMoby->position, moby->position);
+                hills[hillCount].drawMoby->updateDist = -1;
+                hills[hillCount].drawMoby->drawn = 1;
+                hills[hillCount].drawMoby->opacity = 0;
+                hills[hillCount].drawMoby->drawDist = 0x00;
+                hills[hillCount].drawMoby->pUpdate = NULL; // set later
+            }
             ++hillCount;
         }
         ++moby;
@@ -197,26 +211,36 @@ static int kothFindLeader(int *outScore, int *outTie)
     return leaderIdx;
 }
 
-static void kothDeclareWinner(int winnerIdx, int reason)
+static int kothSetWinnerFields(int winnerIdx, int reason, int endGame)
 {
     GameSettings *gs = gameGetSettings();
     GameOptions *go = gameGetOptions();
-    if (!gs || !go)
-        return;
+    GameData *gd = gameGetData();
+    if (!gs || !go || !gd)
+        return 0;
 
     int useTeams = go->GameFlags.MultiplayerGameFlags.Teams;
     int winnerId = useTeams ? gs->PlayerTeams[winnerIdx] : winnerIdx;
     if (winnerId < 0)
-        return;
+        return 0;
 
+    gd->gameEndReason = reason;
     gameSetWinner(winnerId, useTeams);
-    gameEnd(reason);
+    if (endGame)
+        gameEnd(reason);
     gameOverTriggered = 1;
+    return 1;
+}
+
+static void kothDeclareWinner(int winnerIdx, int reason)
+{
+    if (!kothSetWinnerFields(winnerIdx, reason, 1))
+        return;
 }
 
 static void kothCheckVictory(void)
 {
-    if (gameOverTriggered || gameHasEnded())
+    if (gameOverTriggered)
         return;
     if (!gameAmIHost())
         return;
@@ -237,17 +261,21 @@ static void kothCheckVictory(void)
         return;
     }
 
-    if (gd->timeEnd > 0 && gameGetTime() >= gd->timeEnd && !isTie) {
-        kothDeclareWinner(leaderIdx, GAME_END_TIME_UP);
+    int timerActive = (gd->timeStart > 0) && (gd->timeEnd > gd->timeStart);
+    if (timerActive && gameGetTime() >= gd->timeEnd && !isTie) {
+        if (gameHasEnded())
+            kothSetWinnerFields(leaderIdx, GAME_END_TIME_UP, 0);
+        else
+            kothDeclareWinner(leaderIdx, GAME_END_TIME_UP);
     }
 }
 
-static void drawHill(VECTOR center, u32 color)
+static void drawHillAt(VECTOR center, u32 color, float *scroll)
 {
     const int MAX_SEGMENTS = 64;
     const int MIN_SEGMENTS = 8;
     QuadDef quad[3];
-    gfxSetupEffectTex(&quad[0], FX_UNK_2, 0, 0x80);
+    gfxSetupEffectTex(&quad[0], FX_VISIBOMB_HORIZONTAL_LINES, 0, 0x80);
     gfxSetupEffectTex(&quad[2], FX_CIRLCE_NO_FADED_EDGE, 0, 0x80);
 
     quad[0].uv[0] = (UV_t){0, 0};
@@ -256,6 +284,13 @@ static void drawHill(VECTOR center, u32 color)
     quad[0].uv[3] = (UV_t){1, 1};
     quad[1] = quad[0];
     quad[2] = quad[0];
+
+    float uvOffset = 0;
+    quad[0].uv[0].y += uvOffset;
+    quad[0].uv[1].y -= uvOffset;
+    quad[0].uv[2].y += uvOffset;
+    quad[0].uv[3].y -= uvOffset;
+    quad[1] = quad[0];
 
     int alphaOuterNear = (int)(0x00 * KOTH_RING_ALPHA_SCALE) & 0xFF;
     int alphaOuterFar = (int)(0x30 * KOTH_RING_ALPHA_SCALE);
@@ -274,8 +309,8 @@ static void drawHill(VECTOR center, u32 color)
     quad[1].rgba[2] = quad[1].rgba[3] = (alphaMidFar << 24) | baseRgb;
     quad[2].rgba[0] = quad[2].rgba[1] = quad[2].rgba[2] = quad[2].rgba[3] = (alphaCenter << 24) | baseRgb;
 
-    VECTOR xAxis = {KOTH_RING_RADIUS, 0, 0, 0};
-    VECTOR zAxis = {0, KOTH_RING_RADIUS, 0, 0};
+    VECTOR xAxis = {KOTH_RING_RADIUS * 2, 0, 0, 0};
+    VECTOR zAxis = {0, KOTH_RING_RADIUS * 2, 0, 0};
     VECTOR yAxis = {0, 0, KOTH_RING_HEIGHT, 0};
     VECTOR tempRight, tempUp, halfX, halfZ, vRadius, tempCenter;
     vector_scale(halfX, xAxis, .5);
@@ -307,23 +342,23 @@ static void drawHill(VECTOR center, u32 color)
                 quad[k].point[j][3] = 1;
             }
 
+            quad[k].uv[0].x = quad[k].uv[1].x = 0 - *scroll;
+            quad[k].uv[2].x = quad[k].uv[3].x = 1 - *scroll;
+
             gfxDrawQuad(quad[k], NULL);
             vector_rodrigues(vRadius, vRadius, yAxis, thetaStep);
             vector_outerproduct(tempRight, yAxis, vRadius);
             vector_normalize(tempRight, tempRight);
         }
     }
+    *scroll += .007f;
 
     // floor quad
-    VECTOR offset = {0, 0, -1, 0};
     VECTOR corners[4];
-    int j;
-    for (j = 0; j < 4; ++j) {
-        corners[j][0] = center[0] + signs[j][0] * halfX[0] + signs[j][1] * halfZ[0] + offset[0];
-        corners[j][1] = center[1] + signs[j][0] * halfX[1] + signs[j][1] * halfZ[1] + offset[1];
-        corners[j][2] = center[2] + signs[j][0] * halfX[2] + signs[j][1] * halfZ[2] + offset[2];
-        corners[j][3] = 1;
-    }
+    vector_copy(corners[0], (VECTOR){center[0] - fRadius, center[1] - fRadius, center[2], 0});
+    vector_copy(corners[1], (VECTOR){center[0] + fRadius, center[1] - fRadius, center[2], 0});
+    vector_copy(corners[2], (VECTOR){center[0] + fRadius, center[1] + fRadius, center[2], 0});
+    vector_copy(corners[3], (VECTOR){center[0] - fRadius, center[1] + fRadius, center[2], 0});
 
     QuadDef floorQuad;
     gfxSetupEffectTex(&floorQuad, FX_CIRLCE_NO_FADED_EDGE, 0, 0x80);
@@ -332,21 +367,48 @@ static void drawHill(VECTOR center, u32 color)
     floorQuad.uv[2] = (UV_t){1, 0};
     floorQuad.uv[3] = (UV_t){1, 1};
     floorQuad.rgba[0] = floorQuad.rgba[1] = floorQuad.rgba[2] = floorQuad.rgba[3] = (0x20 << 24) | baseRgb;
-    for (j = 0; j < 4; ++j) {
-        floorQuad.point[j][0] = corners[j][0];
-        floorQuad.point[j][1] = corners[j][1];
-        floorQuad.point[j][2] = corners[j][2];
-        floorQuad.point[j][3] = corners[j][3];
-    }
+    vector_copy(floorQuad.point[0], corners[1]);
+    vector_copy(floorQuad.point[1], corners[0]);
+    vector_copy(floorQuad.point[2], corners[2]);
+    vector_copy(floorQuad.point[3], corners[3]);
     gfxDrawQuad(floorQuad, NULL);
+}
+
+static KothHill_t *kothFindHill(Moby *moby)
+{
+    int i;
+    for (i = 0; i < hillCount; ++i) {
+        if (hills[i].moby == moby || hills[i].drawMoby == moby)
+            return &hills[i];
+    }
+    return NULL;
+}
+
+static void drawHill(Moby *moby)
+{
+    u32 baseColor = 0x0080FF00; // green tint for hill marker
+    KothHill_t *hill = kothFindHill(moby);
+    float *scroll = hill ? &hill->scroll : NULL;
+    float fallbackScroll = 0;
+    if (!scroll)
+        scroll = &fallbackScroll;
+    drawHillAt(moby->position, baseColor, scroll);
+}
+
+static void hillUpdate(Moby *moby)
+{
+    gfxRegistserDrawFunction(&drawHill, moby);
 }
 
 static void drawHills(void)
 {
-    u32 baseColor = 0x0080FF00; // green tint for hill marker
     int i;
     for (i = 0; i < hillCount; ++i) {
-        drawHill(hills[i].position, baseColor);
+        if (hills[i].drawMoby) {
+            hills[i].drawMoby->pUpdate = &hillUpdate;
+        } else {
+            drawHillAt(hills[i].position, 0x0080FF00, &hills[i].scroll);
+        }
     }
 }
 
