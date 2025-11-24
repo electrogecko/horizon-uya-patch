@@ -25,12 +25,21 @@ extern PatchGameConfig_t gameConfig;
 #define KOTH_RING_HEIGHT       (1.0f)
 #define KOTH_RING_ALPHA_SCALE  (1.0f)
 #define KOTH_SCORE_TICK_MS     (TIME_SECOND)
+#define KOTH_HILL_ACTIVE_MS    (TIME_SECOND * 60)
+
+// Toggle how the active hill is selected each rotation window
+// Define KOTH_RANDOM_ORDER to cycle hills in a deterministic randomized order without replacement.
+// Leave undefined to rotate in fixed index order.
+#define KOTH_RANDOM_ORDER
 
 typedef struct KothHill {
     VECTOR position;
     Moby *moby;
     Moby *drawMoby;
     float scroll;
+#ifdef KOTH_RANDOM_ORDER
+    int orderIdx;
+#endif
 } KothHill_t;
 
 static KothHill_t hills[KOTH_MAX_HILLS];
@@ -39,15 +48,29 @@ static int initialized = 0;
 static int handlerInstalled = 0;
 static int nextScoreTickTime = 0;
 static int gameOverTriggered = 0;
+static int hillCycleStartTime = 0;
+#ifdef KOTH_RANDOM_ORDER
+static int hillOrder[KOTH_MAX_HILLS];
+static int hillOrderCount = 0;
+static u32 hillOrderSeed = 0;
+
+// simple LCG for deterministic shuffling
+static u32 kothRngNext(u32 *state)
+{
+    *state = (*state * 1664525u + 1013904223u);
+    return *state;
+}
+
+static int kothRandRange(u32 *state, int min, int max)
+{
+    if (max <= min)
+        return min;
+    u32 r = kothRngNext(state);
+    return min + (int)(r % (u32)(max - min));
+}
+#endif
 static int kothScores[GAME_MAX_PLAYERS];
 static int lastBroadcastScore[GAME_MAX_PLAYERS];
-
-static float clamp01(float value)
-{
-    if (value < 0.0f) return 0.0f;
-    if (value > 1.0f) return 1.0f;
-    return value;
-}
 
 static float clampf(float value, float min, float max)
 {
@@ -55,6 +78,8 @@ static float clampf(float value, float min, float max)
     if (value > max) return max;
     return value;
 }
+
+static int kothGetActiveHillIndex(void);
 
 static void vector_rodrigues(VECTOR output, VECTOR v, VECTOR axis, float angle)
 {
@@ -103,6 +128,24 @@ static void scanHillsOnce(void)
         ++moby;
     }
 
+#ifdef KOTH_RANDOM_ORDER
+    hillOrderCount = hillCount;
+    int i;
+    for (i = 0; i < hillCount; ++i)
+        hillOrder[i] = i;
+    // deterministic Fisher-Yates shuffle
+    hillOrderSeed = 0;
+    GameData *gd = gameGetData();
+    if (gd)
+        hillOrderSeed = (u32)gd->timeStart;
+    for (i = hillCount - 1; i > 0; --i) {
+        int j = kothRandRange(&hillOrderSeed, 0, i + 1);
+        int tmp = hillOrder[i];
+        hillOrder[i] = hillOrder[j];
+        hillOrder[j] = tmp;
+    }
+#endif
+
     initialized = 1;
 }
 
@@ -111,18 +154,16 @@ static int playerInsideHill(Player *player)
     if (!player)
         return 0;
 
-    int i;
-    VECTOR delta;
-    for (i = 0; i < hillCount; ++i) {
-        vector_subtract(delta, player->playerPosition, hills[i].position);
-        // ignore height to keep circle flat on ground
-        delta[2] = 0;
-        float sqrDist = vector_sqrmag(delta);
-        if (sqrDist <= (KOTH_RING_RADIUS * KOTH_RING_RADIUS))
-            return 1;
-    }
+    int activeIdx = kothGetActiveHillIndex();
+    if (activeIdx < 0 || activeIdx >= hillCount)
+        return 0;
 
-    return 0;
+    VECTOR delta;
+    vector_subtract(delta, player->playerPosition, hills[activeIdx].position);
+    // ignore height to keep circle flat on ground
+    delta[2] = 0;
+    float sqrDist = vector_sqrmag(delta);
+    return sqrDist <= (KOTH_RING_RADIUS * KOTH_RING_RADIUS);
 }
 
 static void broadcastScore(int playerIdx)
@@ -384,6 +425,42 @@ static KothHill_t *kothFindHill(Moby *moby)
     return NULL;
 }
 
+static void kothEnsureCycleStart(void)
+{
+    if (hillCycleStartTime == 0 && hillCount > 0) {
+        GameData *gd = gameGetData();
+        if (gd && gd->timeStart > 0)
+            hillCycleStartTime = gd->timeStart;
+        else
+            hillCycleStartTime = gameGetTime();
+    }
+}
+
+static int kothGetActiveHillIndex(void)
+{
+    if (hillCount <= 0)
+        return -1;
+
+    kothEnsureCycleStart();
+
+    int duration = KOTH_HILL_ACTIVE_MS;
+    if (duration <= 0)
+        return 0;
+
+    int elapsed = gameGetTime() - hillCycleStartTime;
+    if (elapsed < 0)
+        elapsed = 0;
+
+    int idx = (elapsed / duration) % hillCount;
+#ifdef KOTH_RANDOM_ORDER
+    if (hillOrderCount <= 0 || idx >= hillOrderCount)
+        return idx;
+    return hillOrder[idx];
+#else
+    return idx;
+#endif
+}
+
 static void drawHill(Moby *moby)
 {
     u32 baseColor = 0x0080FF00; // green tint for hill marker
@@ -402,11 +479,12 @@ static void hillUpdate(Moby *moby)
 
 static void drawHills(void)
 {
+    int activeIdx = kothGetActiveHillIndex();
     int i;
     for (i = 0; i < hillCount; ++i) {
         if (hills[i].drawMoby) {
-            hills[i].drawMoby->pUpdate = &hillUpdate;
-        } else {
+            hills[i].drawMoby->pUpdate = (i == activeIdx) ? &hillUpdate : NULL;
+        } else if (i == activeIdx) {
             drawHillAt(hills[i].position, 0x0080FF00, &hills[i].scroll);
         }
     }
@@ -496,6 +574,10 @@ void kothReset(void)
     hillCount = 0;
     nextScoreTickTime = 0;
     gameOverTriggered = 0;
+    hillCycleStartTime = 0;
+#ifdef KOTH_RANDOM_ORDER
+    hillOrderCount = 0;
+#endif
     memset(hills, 0, sizeof(hills));
     memset(kothScores, 0, sizeof(kothScores));
     memset(lastBroadcastScore, 0, sizeof(lastBroadcastScore));
