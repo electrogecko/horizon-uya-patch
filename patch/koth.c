@@ -439,8 +439,8 @@ static void drawHillAt(VECTOR center, u32 color, float *scroll)
                 quad[k].point[j][3] = 1;
             }
 
-            quad[k].uv[0].x = quad[k].uv[1].x = 0 - *scroll;
-            quad[k].uv[2].x = quad[k].uv[3].x = 1 - *scroll;
+            quad[k].uv[0].y = quad[k].uv[1].y = 0 - *scroll;
+            quad[k].uv[2].y = quad[k].uv[3].y = 1 - *scroll;
 
             gfxDrawQuad(quad[k], NULL);
             vector_rodrigues(vRadius, vRadius, yAxis, thetaStep);
