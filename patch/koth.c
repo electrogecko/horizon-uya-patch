@@ -30,6 +30,7 @@ extern PatchGameConfig_t gameConfig;
 #define KOTH_RING_ALPHA_SCALE  (1.0f)
 #define KOTH_SCORE_TICK_MS     (TIME_SECOND)
 #define KOTH_HILL_ACTIVE_MS    (TIME_SECOND * 60)
+#define COUNT_OF(x) (sizeof(x)/sizeof(0[x]))
 
 // Toggle how the active hill is selected each rotation window
 // Define KOTH_RANDOM_ORDER to cycle hills in a deterministic randomized order without replacement.
@@ -213,11 +214,32 @@ static void updateScores(void)
 
 static int kothGetScoreLimit(void)
 {
-    int setting = (int)gameConfig.kothScoreLimit;
-    if (setting <= 0)
-        return 0;
+    static const int SCORE_LIMIT_OPTIONS[] = {
+        0, 50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 750, 1000, 2000
+    };
 
-    return setting * 50;
+    int idx = (int)gameConfig.grKothScoreLimit;
+    if (idx < 0 || idx >= (int)COUNT_OF(SCORE_LIMIT_OPTIONS))
+        return SCORE_LIMIT_OPTIONS[0];
+
+    return SCORE_LIMIT_OPTIONS[idx];
+}
+
+static int kothGetHillDurationMs(void)
+{
+    static const int HILL_DURATION_OPTIONS_MS[] = {
+        KOTH_HILL_ACTIVE_MS,        // 60
+        TIME_SECOND * 120,
+        TIME_SECOND * 180,
+        TIME_SECOND * 240,
+        TIME_SECOND * 300
+    };
+
+    int idx = (int)gameConfig.grKothHillDuration;
+    if (idx < 0 || idx >= (int)COUNT_OF(HILL_DURATION_OPTIONS_MS))
+        idx = 0;
+
+    return HILL_DURATION_OPTIONS_MS[idx];
 }
 
 static int kothFindLeader(int *outScore, int *outTie)
@@ -360,11 +382,36 @@ static void kothCheckVictory(void)
 
     int timerActive = (gd->timeStart > 0) && (gd->timeEnd > gd->timeStart);
     if (timerActive && gameGetTime() >= gd->timeEnd && !isTie) {
-        if (gameHasEnded())
-            kothSetWinnerFields(leaderIdx, GAME_END_TIME_UP, 0);
-        else
-            kothDeclareWinner(leaderIdx, GAME_END_TIME_UP);
+        // Force the timer outcome to be authoritative (even if the base game already fired end-game once).
+        // This mirrors how patchSiegeTimeUp immediately ends the game with its own winner.
+        kothSetWinnerFields(leaderIdx, GAME_END_TIME_UP, 0);
+        gameEnd(GAME_END_TIME_UP);
     }
+}
+
+int kothHandleTimeUp(int reason)
+{
+    if (reason != GAME_END_TIME_UP)
+        return 0;
+    if (!gameAmIHost())
+        return 0;
+
+    GameData *gd = gameGetData();
+    if (!gd)
+        return 0;
+
+    int timerActive = (gd->timeStart > 0) && (gd->timeEnd > gd->timeStart);
+    if (!timerActive)
+        return 0;
+
+    int leaderScore = 0;
+    int isTie = 0;
+    int leaderIdx = kothFindLeader(&leaderScore, &isTie);
+    if (leaderIdx < 0 || isTie)
+        return 0;
+
+    kothSetWinnerFields(leaderIdx, GAME_END_TIME_UP, 1);
+    return 1;
 }
 
 static void drawHillAt(VECTOR center, u32 color, float *scroll)
@@ -439,8 +486,15 @@ static void drawHillAt(VECTOR center, u32 color, float *scroll)
                 quad[k].point[j][3] = 1;
             }
 
+            // Scroll texture vertically to keep the ring graphic oriented upward.
             quad[k].uv[0].y = quad[k].uv[1].y = 0 - *scroll;
             quad[k].uv[2].y = quad[k].uv[3].y = 1 - *scroll;
+
+            // Horizontal scroll option (kept for reference):
+            // float u0 = ((float)i / segments) - *scroll;
+            // float u1 = ((float)(i + 1) / segments) - *scroll;
+            // quad[k].uv[0].x = quad[k].uv[1].x = u0;
+            // quad[k].uv[2].x = quad[k].uv[3].x = u1;
 
             gfxDrawQuad(quad[k], NULL);
             vector_rodrigues(vRadius, vRadius, yAxis, thetaStep);
@@ -499,7 +553,7 @@ static int kothGetActiveHillIndex(void)
 
     kothEnsureCycleStart();
 
-    int duration = KOTH_HILL_ACTIVE_MS;
+    int duration = kothGetHillDurationMs();
     if (duration <= 0)
         return 0;
 
@@ -687,6 +741,13 @@ void kothInit(void)
         netInstallCustomMsgHandler(CUSTOM_MSG_ID_KOTH_SCORE_UPDATE, &kothOnReceiveScore);
         handlerInstalled = 1;
     }
+
+    // Disable base-game frag limit so KOTH doesn't end on kills.
+    GameOptions *go = gameGetOptions();
+    if (go) {
+        go->GameFlags.MultiplayerGameFlags.FragLimit = 0;
+    }
+
     scanHillsOnce();
 }
 

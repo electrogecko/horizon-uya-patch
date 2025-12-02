@@ -255,14 +255,14 @@ void grGameStart(void)
 	if (gameConfig.grNodeSelectTimer)
 		runSelectNodeTimer();
 
-	if (gameConfig.grSiegeNoTies)
-		patchSiegeTimeUp();
+    if (gameConfig.grSiegeNoTies || gameConfig.grCustomModeId == CUSTOM_MODE_KOTH)
+        patchSiegeTimeUp();
 
 	if (gameConfig.grSiegeDominationNodes)
 		domination();
 
-	if (gameConfig.customModeId == CUSTOM_MODE_KOTH)
-		kothTick();
+    if (gameConfig.grCustomModeId == CUSTOM_MODE_KOTH)
+        kothTick();
 
 	FirstPass = 0;
 }

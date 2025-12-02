@@ -273,7 +273,7 @@ char dataCustomMapsWithExclusiveGameMode[] = {
 const int dataCustomMapsWithExclusiveGameModeCount = sizeof(dataCustomMapsWithExclusiveGameMode)/sizeof(char);
 
 MenuElem_OrderedListData_t dataCustomModes = {
-  .value = &gameConfig.customModeId,
+  .value = &gameConfig.grCustomModeId,
   .stateHandler = menuStateHandler_SelectedGameModeOverride,
   .count = 3,
   .items = {
@@ -297,10 +297,17 @@ const char* CustomModeShortNames[] = {
 };
 
 MenuElem_ListData_t dataKothScoreLimit = {
-    .value = &gameConfig.kothScoreLimit,
+    .value = &gameConfig.grKothScoreLimit,
     .stateHandler = menuStateHandler_KOTH,
-    .count = 11,
-    .items = { "Off", "50", "100", "150", "200", "250", "300", "350", "400", "450", "500" }
+    .count = 14,
+    .items = { "Off", "50", "100", "150", "200", "250", "300", "350", "400", "450", "500", "750", "1000", "2000" }
+};
+
+MenuElem_ListData_t dataKothHillDuration = {
+    .value = &gameConfig.grKothHillDuration,
+    .stateHandler = menuStateHandler_KOTH,
+    .count = 5,
+    .items = { "60", "120", "180", "240", "300" }
 };
 
 MenuElem_ListData_t dataV2_Setting = {
@@ -484,6 +491,7 @@ MenuElem_t menuElementsGameSettings[] = {
   // { "Map Override", listActionHandler, menuStateAlwaysEnabledHandler, &dataCustomMaps, "Play on any of the custom maps from the Horizon Map Pack. Visit https://rac-horizon.com to download the map pack." },
   { "Gamemode Override", gmOverrideListActionHandler, menuStateHandler_GameModeOverride, &dataCustomModes, "Change to one of the Horizon Custom Gamemodes." },
   { "KOTH Points", listActionHandler, menuStateHandler_KOTH, &dataKothScoreLimit, "Points needed to win King of the Hill (0 = disabled, uses timer if set)." },
+  { "KOTH Hill Duration", listActionHandler, menuStateHandler_KOTH, &dataKothHillDuration, "How long a hill stays active before rotating to the next." },
   { "Preset", listActionHandler, menuStateAlwaysEnabledHandler, &dataGameConfigPreset, "Select one of the preconfigured game rule presets or manually set the custom game rules below." },
 
   { "Game Rules", labelActionHandler, menuLabelStateHandler, (void*)LABELTYPE_HEADER },
@@ -612,7 +620,7 @@ int menuStateHandler_SelectedMapOverride(MenuElem_OrderedListData_t* listData, c
   if (!value)
     return 0;
 
-  char gm = gameConfig.customModeId;
+  char gm = gameConfig.grCustomModeId;
   char v = *value;
 
   // here we can disable certain maps depending on the gamemode
@@ -732,7 +740,7 @@ void menuStateHandler_DM(TabElem_t* tab, MenuElem_t* element, int* state)
 
 void menuStateHandler_KOTH(TabElem_t* tab, MenuElem_t* element, int* state)
 {
-  if (gameConfig.customModeId != CUSTOM_MODE_KOTH)
+  if (gameConfig.grCustomModeId != CUSTOM_MODE_KOTH)
     *state = ELEMENT_HIDDEN;
   else if (preset)
     *state = ELEMENT_SELECTABLE | ELEMENT_VISIBLE;
@@ -2384,7 +2392,7 @@ int onSetGameConfig(void * connection, void * data)
   memcpy(&config, data, sizeof(PatchGameConfig_t));
 
   // check for changes
-  redownloadCustomModeBinaries |= config.customModeId != gameConfig.customModeId;
+  redownloadCustomModeBinaries |= config.grCustomModeId != gameConfig.grCustomModeId;
 
   // copy it over
   memcpy(&gameConfig, data, sizeof(PatchGameConfig_t));
@@ -2422,11 +2430,11 @@ void onConfigUpdate(void)
       mapName = MapLoaderState.MapName;
 
     // get mode override name
-    if (gameConfig.customModeId > 0) {
-      modeName = (char*)CustomModeShortNames[(int)gameConfig.customModeId];
+    if (gameConfig.grCustomModeId > 0) {
+      modeName = (char*)CustomModeShortNames[(int)gameConfig.grCustomModeId];
       if (!modeName) {
         for (i = 0; i < dataCustomModes.count; ++i) {
-          if (dataCustomModes.items[i].value == (int)gameConfig.customModeId) {
+          if (dataCustomModes.items[i].value == (int)gameConfig.grCustomModeId) {
             modeName = dataCustomModes.items[i].name;
             break;
           }
@@ -2490,8 +2498,8 @@ void onConfigInitialize(void)
 
   // set defaults
 #if DEFAULT_GAMEMODE > 0
-  gameConfigHostBackup.customModeId = DEFAULT_GAMEMODE;
-  gameConfig.customModeId = DEFAULT_GAMEMODE;
+  gameConfigHostBackup.grCustomModeId = DEFAULT_GAMEMODE;
+  gameConfig.grCustomModeId = DEFAULT_GAMEMODE;
 #endif
 }
 

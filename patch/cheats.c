@@ -1181,6 +1181,12 @@ void runSelectNodeTimer(void)
  */
 void patchSiegeTimeUp_Logic(int reason)
 {
+    if (gameConfig.grCustomModeId == CUSTOM_MODE_KOTH) {
+        if (!kothHandleTimeUp(reason))
+            gameEnd(reason);
+        return;
+    }
+
     GameData *gameData = gameGetData();
     // get base health
     float blueHealth = gameData->allYourBaseGameData->hudHealth[0];
