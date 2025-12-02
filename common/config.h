@@ -31,8 +31,6 @@ typedef struct PatchConfig {
 typedef struct PatchGameConfig {
   // Maps
   char isCustomMap;
-  char customModeId;
-  char kothScoreLimit;
 
   // Game Rules
   char grRadarBlipsDistance;
@@ -67,6 +65,9 @@ typedef struct PatchGameConfig {
   char grSiegeNoTies;
   char grSiegeDominationNodes;
   char grNewPlayerSync;
+  char grCustomModeId;
+  char grKothScoreLimit;
+  char grKothHillDuration;
 
   // Party
   char prSurvivor;
@@ -127,7 +128,7 @@ enum CUSTOM_MODE_ID {
   // CUSTOM_MODE_INFECTED,
   // CUSTOM_MODE_JUGGERNAUGHT,
   CUSTOM_MODE_MIDFLAG = 1,
-  CUSTOM_MODE_KOTH = 2,
+  CUSTOM_MODE_KOTH = 4,
   // always at the end to indicate how many items there are
   CUSTOM_MODE_COUNT
 };
