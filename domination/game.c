@@ -1,4 +1,5 @@
 #include <tamtypes.h>
+
 #include <libuya/stdio.h>
 #include <libuya/string.h>
 #include <libuya/player.h>
@@ -6,6 +7,8 @@
 #include <libuya/game.h>
 #include <libuya/pad.h>
 #include <libuya/uya.h>
+#include <libuya/weapon.h>
+#include <libuya/interop.h>
 #include <libuya/moby.h>
 #include <libuya/graphics.h>
 #include <libuya/gamesettings.h>
@@ -13,10 +16,10 @@
 #include <libuya/team.h>
 #include <libuya/ui.h>
 #include <libuya/time.h>
+#include <libuya/camera.h>
 #include <libuya/gameplay.h>
-
-#include "config.h"
-#include "include/game.h"
+#include <libuya/guber.h>
+#include <libuya/sound.h>
 
 #define MAX_SEGMENTS                        (64)
 #define MIN_SEGMENTS                        (8)
@@ -76,7 +79,8 @@ static u32 lerpColor(u32 a, u32 b, float t)
 // if local player is blue, invert
 static u32 getBoltCrankTextColor(float percent01, int invert)
 {
-    const u32 redColor = 0x00FF5050;
+    // Match the pure red used elsewhere (e.g. uya-cheats) instead of the lighter tint
+    const u32 redColor = 0x00FF0000;
     const u32 whiteColor = 0x00FFFFFF;
     const u32 blueColor = 0x003060FF;
 
@@ -214,7 +218,7 @@ void drawBase(Moby *base)
     QuadDef quad[3];
     // get texture info (tex0, tex1, clamp, alpha)
     //gfxSetupEffectTex(&quad[0], FX_TIRE_TRACKS + 1, 0, 0x80);
-    gfxSetupEffectTex(&quad[0], FX_UNK_2, 0, 0x80);
+    gfxSetupEffectTex(&quad[0], FX_VISIBOMB_HORIZONTAL_LINES, 0, 0x80);
     gfxSetupEffectTex(&quad[2], FX_CIRLCE_NO_FADED_EDGE, 0, 0x80);
 
     quad[0].uv[0] = (UV_t){0, 0}; // bottom left (-, -)
@@ -347,7 +351,6 @@ int baseCheckIfInside(VECTOR basePos, VECTOR playerPos)
 void basePlayerUpdate(Moby *this)
 {
     DominationBase_t *pvar = (DominationBase_t*)this->pVar;
-    GameSettings *gs = gameGetSettings();
     int i, j;
     int localPlayerInside = 0;
     int localPlayerColor = -1;
@@ -535,50 +538,19 @@ Moby *spawnBaseMobies(Moby *node, Moby *boltCrank)
     return moby;
 }
 
-void onGameplayLoad_adjustSiegePadTies(GameplayHeaderDef_t * gameplay, float targetZ)
+void domination(void)
 {
-	if (!gameplay || !gameplay->TieInstancesOffset)
+	if (!isInGame()) {
+        domInfo.gameState = 0;
 		return;
+    }
 
-	TieInstanceTableHeader_t * header = (TieInstanceTableHeader_t*)((u8*)gameplay + gameplay->TieInstancesOffset);
-	int count = header->Count;
-	if (count <= 0 || count > 4096)
-		return;
-
-	TieInstanceEntry_t * entries = (TieInstanceEntry_t*)((u8*)header + sizeof(TieInstanceTableHeader_t));
-	int i;
-	for (i = 0; i < count; ++i) {
-		if (entries[i].OClass == MOBY_ID_SIEGE_PAD_TIE)
-			entries[i].Matrix[3][2] = targetZ;
-	}
-}
-
-void gameTick(void)
-{
 	if (domInfo.gameState == 0) {
+        memset(&domInfo, 0, sizeof(DominationInfo_t));
 		getBases();
 		domInfo.gameState = 1;
 		domInfo.baseRaddius = BASE_RADIUS;
 	}
 
     drawDominationHud();
-}
-
-void initialize(PatchGameConfig_t* gameConfig)
-{
-	// hook messages
-	// netHookMessages();
-
-	memset(&domInfo, 0, sizeof(DominationInfo_t));
-
-	// give a 1 second delay before finalizing the initialization.
-	// this helps prevent the slow loaders from desyncing
-	static int startDelay = 60 * 2;
-	if (startDelay > 0) {
-		--startDelay;
-		return;
-	}
-
-	// finalize initialization
-	State.Initialized = 1;
 }

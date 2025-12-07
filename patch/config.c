@@ -279,8 +279,8 @@ MenuElem_OrderedListData_t dataCustomModes = {
     {CUSTOM_MODE_NONE, "None"},
     // {CUSTOM_MODE_INFECTED, "Infected"},
     // {CUSTOM_MODE_JUGGERNAUGHT, "Juggernaut"},
-    {CUSTOM_MODE_DOMINATION, "Domination"},
     {CUSTOM_MODE_MIDFLAG, "MidFlag"},
+    {CUSTOM_MODE_KOTH, "King of the Hill"},
   }
 };
 
@@ -290,9 +290,9 @@ MenuElem_OrderedListData_t dataCustomModes = {
 const char* CustomModeShortNames[] = {
   [CUSTOM_MODE_NONE] NULL,
   // [CUSTOM_MODE_INFECTED] "Infected",
-  // [CUSTOM_MODE_JUGGERNAUT] NULL,
+  // [CUSTOM_MODE_JUGGERNAUGHT] NULL,
   [CUSTOM_MODE_MIDFLAG] NULL,
-  [CUSTOM_MODE_DOMINATION] "Domination"
+  [CUSTOM_MODE_KOTH] "KOTH"
 };
 
 MenuElem_ListData_t dataV2_Setting = {
@@ -448,7 +448,6 @@ MenuElem_t menuElementsGeneral[] = {
 #endif
 */
   { "Always Show Health", toggleActionHandler, menuStateAlwaysEnabledHandler, &config.alwaysShowHealth, "Let that health bar hide no longer!  This will make it so the health bar is always visible." },
-  { "Enable Team Info", toggleActionHandler, menuStateAlwaysEnabledHandler, &config.enableTeamInfo, "Display team health and cycle v2 status on the bottom left of your screen." },
   { "Camera Pull", toggleInvertedActionHandler, menuStateAlwaysEnabledHandler, &config.aimAssist, "Toggles code that pulls the camera towards nearby targets when aiming." },
   { "Camera Shake", toggleInvertedActionHandler, menuStateAlwaysEnabledHandler, &config.disableCameraShake, "Toggles the camera shake caused by nearby explosions." },
   { "Disable D-Pad Movement", toggleActionHandler, menuStateAlwaysEnabledHandler, &config.disableDpadMovement, "Disables the d-pad moving your character in game." },
@@ -510,6 +509,7 @@ MenuElem_t menuElementsGameSettings[] = {
   { "Node Select Timer", rangeActionHandler, menuStateHandler_Nodes, &dataNodeSelectTimer, "Amount of time a player has for choosing a node.  If timer runs out, player is spawned on current selected node." },
   { "All Nodes Countdown", listActionHandler, menuStateHandler_Nodes, &dataAllNodesTimer, "If one team owns all nodes, a countdown stsarts.  Team with all nodes win if countdown reaches zero." },
   { "No Ties in Timed Games", toggleActionHandler, menuStateHandler_Siege, &gameConfig.grSiegeNoTies, "Team with most base damage dealt wins!" },
+  { "Domination style nodes", toggleActionHandler, menuStateHandler_Siege, &gameConfig.grSiegeDominationNodes, "Capture Nodes by standing in their radius instead of cranking a bolt!" },
 
   { "Base/Node Modifications", labelActionHandler, menuLabelStateHandler_CTFandSiege, (void*)LABELTYPE_HEADER },
   { "Gatling Turret Health", listActionHandler, menuStateHandler_BaseDefenses, &dataSetGatlingTurretHealth, "Increase or decrease the amount of health each teams base turrets have." },
@@ -674,19 +674,8 @@ int menuStateHandler_SelectedGameModeOverride(MenuElem_OrderedListData_t* listDa
       }
       #endif
 */
-      case CUSTOM_MODE_MIDFLAG: {
-        if (gs->GameType == GAMETYPE_CTF)
-          return 1;
-        
-        
-        *value = CUSTOM_MODE_NONE;
-        return 0; 
-      }
-      case CUSTOM_MODE_DOMINATION: {
-        if (gs->GameType == GAMETYPE_SIEGE || GAMETYPE_CTF)
-          return 1;
-        
-        
+      CUSTOM_MODE_MIDFLAG: {
+        if (gs->GameType == GAMETYPE_CTF) return 1;
         *value = CUSTOM_MODE_NONE;
         return 0; 
       }
@@ -2696,6 +2685,7 @@ void configMenuDisable(void)
         gameConfig.grAllNodesTimer = 2; // 1 minutes countdown when all nodes owned
         gameConfig.grSiegeNoTies = 1; // No ties - team with most base damage wins
         gameConfig.grSuicidePenaltyTimer = 3; // 0 seconds suicide penalty
+        gameConfig.grSiegeDominationNodes = 1; // on
         // Base / Node mods
         gameConfig.grSetGatlingTurretHealth = 4; // 3x
         gameConfig.grBaseHealthPadActive = 0; // Off
