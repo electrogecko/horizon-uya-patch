@@ -68,6 +68,7 @@ typedef struct PatchGameConfig {
   char grCustomModeId;
   char grKothScoreLimit;
   char grKothHillDuration;
+  int grSeed;
 
   // Party
   char prSurvivor;
@@ -75,7 +76,7 @@ typedef struct PatchGameConfig {
   char prLoadoutWeaponsOnly;
   char prGravityBombTweakers;
   char prDisableDlStyleFlips;
-} PatchGameConfig_t;
+} __attribute__((packed)) PatchGameConfig_t;
 
 typedef struct PatchPatches {
   PatchConfig_t config;
