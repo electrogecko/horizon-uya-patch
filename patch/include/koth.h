@@ -3,6 +3,5 @@
 
 void kothReset(void);
 void kothTick(void);
-int kothHandleTimeUp(int reason);
 
 #endif // _PATCH_KOTH_H_

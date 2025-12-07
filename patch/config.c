@@ -2513,6 +2513,9 @@ void configTrySendGameConfig(void)
   tabElements[1].stateHandler(&tabElements[1], &state);
   if (state & ELEMENT_EDITABLE)
   {
+    // Generate a per-match seed for KOTH; clients will use this to sync hill order.
+    gameConfig.grSeed = (int)gameGetTime();
+
     // validate everything
     for (i = 0; i < tabsCount; ++i)
     {

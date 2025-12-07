@@ -255,7 +255,7 @@ void grGameStart(void)
 	if (gameConfig.grNodeSelectTimer)
 		runSelectNodeTimer();
 
-    if (gameConfig.grSiegeNoTies || gameConfig.grCustomModeId == CUSTOM_MODE_KOTH)
+    if (gameConfig.grSiegeNoTies)
         patchSiegeTimeUp();
 
 	if (gameConfig.grSiegeDominationNodes)

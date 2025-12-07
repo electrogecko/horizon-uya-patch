@@ -18,6 +18,13 @@
 #include "messageid.h"
 #include "include/config.h"
 
+#define KOTH_DEBUG
+#ifdef KOTH_DEBUG
+#define KOTH_LOG(fmt, args...) printf(fmt, ##args)
+#else
+#define KOTH_LOG(fmt, args...) ((void)0)
+#endif
+
 #ifndef TEAM_MAX
 #define TEAM_MAX 8
 #endif
@@ -30,7 +37,7 @@ extern PatchGameConfig_t gameConfig;
 #define KOTH_RING_ALPHA_SCALE  (1.0f)
 #define KOTH_SCORE_TICK_MS     (TIME_SECOND)
 #define KOTH_HILL_ACTIVE_MS    (TIME_SECOND * 60)
-#define COUNT_OF(x) (sizeof(x)/sizeof(0[x]))
+#define KOTH_NAME_MAX_LEN      (7)
 
 // Toggle how the active hill is selected each rotation window
 // Define KOTH_RANDOM_ORDER to cycle hills in a deterministic randomized order without replacement.
@@ -50,6 +57,9 @@ typedef struct KothHill {
 static KothHill_t hills[KOTH_MAX_HILLS];
 static int hillCount = 0;
 static int initialized = 0;
+static int gameEndHookInstalled = 0;
+static int gameEndHandled = 0;
+static char kothTitle[32];
 static int handlerInstalled = 0;
 static int nextScoreTickTime = 0;
 static int gameOverTriggered = 0;
@@ -58,6 +68,7 @@ static int hillCycleStartTime = 0;
 static int hillOrder[KOTH_MAX_HILLS];
 static int hillOrderCount = 0;
 static u32 hillOrderSeed = 0;
+static u32 hillOrderShuffleNonce = 0;
 
 // simple LCG for deterministic shuffling
 static u32 kothRngNext(u32 *state)
@@ -76,6 +87,63 @@ static int kothRandRange(u32 *state, int min, int max)
 #endif
 static int kothScores[GAME_MAX_PLAYERS];
 static int lastBroadcastScore[GAME_MAX_PLAYERS];
+// TIME_UP gameEnd callsites (Team modes)
+static VariableAddress_t vaGameTimerEndHookDmTeams = {
+#if UYA_PAL
+    .Lobby = 0x0067063c,
+    .Bakisi = 0x00543fe4,
+    .Hoven = 0x005461ac,
+    .OutpostX12 = 0x0053ba84,
+    .KorgonOutpost = 0x0053916c,
+    .Metropolis = 0x0053856c,
+    .BlackwaterCity = 0x00535d54,
+    .CommandCenter = 0x005355ac,
+    .BlackwaterDocks = 0x00537e2c,
+    .AquatosSewers = 0x0053712c,
+    .MarcadiaPalace = 0x00536aac,
+#else
+    .Lobby = 0x0066dcec,
+    .Bakisi = 0x005416d4,
+    .Hoven = 0x005437dc,
+    .OutpostX12 = 0x005390f4,
+    .KorgonOutpost = 0x0053685c,
+    .Metropolis = 0x00535c5c,
+    .BlackwaterCity = 0x005333c4,
+    .CommandCenter = 0x00532df4,
+    .BlackwaterDocks = 0x00535634,
+    .AquatosSewers = 0x00534974,
+    .MarcadiaPalace = 0x005342b4,
+#endif
+};
+
+// TIME_UP gameEnd callsites (Free-For-All / standard DM). Unknown maps remain 0.
+static VariableAddress_t vaGameTimerEndHookDmNoTeams = {
+#if UYA_PAL
+    .Lobby = 0x0067063c,
+    .Bakisi = 0x00543fe4,
+    .Hoven = 0x005461ac,
+    .OutpostX12 = 0x0053ba84,
+    .KorgonOutpost = 0x0053916c,
+    .Metropolis = 0x0053856c,
+    .BlackwaterCity = 0x00535d54,
+    .CommandCenter = 0x005355ac,
+    .BlackwaterDocks = 0x00537e2c,
+    .AquatosSewers = 0x0053712c,
+    .MarcadiaPalace = 0x00536aac,
+#else
+    .Lobby = 0x0066dcec,
+    .Bakisi = 0x005416d4,
+    .Hoven = 0x005437dc,
+    .OutpostX12 = 0x005390f4,
+    .KorgonOutpost = 0x0053685c,
+    .Metropolis = 0x00535c5c,
+    .BlackwaterCity = 0x005333c4,
+    .CommandCenter = 0x00532df4,
+    .BlackwaterDocks = 0x00535634,
+    .AquatosSewers = 0x00534974,
+    .MarcadiaPalace = 0x005342b4,
+#endif
+};
 
 static float clampf(float value, float min, float max)
 {
@@ -86,6 +154,14 @@ static float clampf(float value, float min, float max)
 
 static int kothGetActiveHillIndex(void);
 static int kothUseTeams(void);
+
+static void kothCopyName(char *dst, const char *src)
+{
+    int i = 0;
+    for (i = 0; i < KOTH_NAME_MAX_LEN && src[i]; ++i)
+        dst[i] = src[i];
+    dst[i] = 0;
+}
 
 static int kothUseTeams(void)
 {
@@ -148,10 +224,9 @@ static void scanHillsOnce(void)
     for (i = 0; i < hillCount; ++i)
         hillOrder[i] = i;
     // deterministic Fisher-Yates shuffle
-    hillOrderSeed = 0;
-    GameData *gd = gameGetData();
-    if (gd)
-        hillOrderSeed = (u32)gd->timeStart;
+    hillOrderSeed = (u32)gameConfig.grSeed;
+    if (!hillOrderSeed)
+        hillOrderSeed = 1;
     for (i = hillCount - 1; i > 0; --i) {
         int j = kothRandRange(&hillOrderSeed, 0, i + 1);
         int tmp = hillOrder[i];
@@ -201,7 +276,7 @@ static void updateScores(void)
     int i;
     for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
         Player *p = players[i];
-        if (!p || playerIsDead(p))
+        if (!p || playerIsDead(p) || p->vehicle)
             continue;
 
         if (playerInsideHill(p) && p->isLocal) {
@@ -357,6 +432,46 @@ static void kothDeclareWinner(int winnerIdx, int reason)
         return;
 }
 
+static void runGameEnd(int reason)
+{
+    // Not KOTH: forward to the original gameEnd without custom handling.
+    if (gameConfig.grCustomModeId != CUSTOM_MODE_KOTH) {
+        gameEnd(reason);
+        return;
+    }
+
+    /*
+     * Hooked gameEnd callsite: run custom logic once, then forward to the real gameEnd.
+     */
+    int forwardReason = reason;
+#ifdef KOTH_DEBUG
+    GameData *gd = gameGetData();
+    int timeNow = gameGetTime();
+    int timeStart = gd ? gd->timeStart : -1;
+    int timeEnd = gd ? gd->timeEnd : -1;
+    KOTH_LOG("[KOTH][DBG] runGameEnd reason=%d timeNow=%d timeStart=%d timeEnd=%d handled=%d\n", reason, timeNow, timeStart, timeEnd, gameEndHandled);
+#endif
+
+    if (!gameEndHandled) {
+        gameEndHandled = 1;
+        if (reason == GAME_END_TIME_UP) {
+            int leaderScore = 0;
+            int isTie = 0;
+            int leaderIdx = kothFindLeader(&leaderScore, &isTie);
+            KOTH_LOG("[KOTH][DBG] runGameEnd TIME_UP leaderIdx=%d leaderScore=%d isTie=%d\n", leaderIdx, leaderScore, isTie);
+            if (leaderIdx >= 0 && !isTie) {
+                // Mirror score-limit path to avoid base TIME_UP overriding the winner.
+                kothSetWinnerFields(leaderIdx, GAME_END_TEAM_WIN, 0);
+                KOTH_LOG("[KOTH][DBG] runGameEnd set winner idx=%d reason=%d (TEAM_WIN)\n", leaderIdx, GAME_END_TEAM_WIN);
+                forwardReason = GAME_END_TEAM_WIN;
+            }
+        }
+    }
+
+    // Forward to original gameEnd.
+    gameEnd(forwardReason);
+}
+
 static void kothCheckVictory(void)
 {
     if (gameOverTriggered)
@@ -371,6 +486,48 @@ static void kothCheckVictory(void)
     int leaderScore = 0;
     int isTie = 0;
     int leaderIdx = kothFindLeader(&leaderScore, &isTie);
+
+    int timeStart = gd ? gd->timeStart : 0;
+    int timeEndRaw = gd ? gd->timeEnd : 0;
+    // Treat timeEnd as a duration from timeStart; base game appears to keep duration rather than absolute end.
+    int resolvedEnd = (timeStart > 0 && timeEndRaw > 0) ? (timeStart + timeEndRaw) : -1;
+    int timerActive = resolvedEnd > timeStart;
+
+    if (timerActive) {
+        int now = gameGetTime();
+        int timeLeft = resolvedEnd - now;
+        static int lastTimerDebugSec = -1;
+        int nowSec = now / 1000;
+        if (timeLeft <= 2000 && nowSec != lastTimerDebugSec) {
+#ifdef KOTH_DEBUG
+            KOTH_LOG("[KOTH][DBG] timer expire check timeNow=%d timeStart=%d timeEndRaw=%d resolvedEnd=%d timeLeft=%d leaderIdx=%d leaderScore=%d isTie=%d\n", now, timeStart, timeEndRaw, resolvedEnd, timeLeft, leaderIdx, leaderScore, isTie);
+            lastTimerDebugSec = nowSec;
+            // Dump scoreboard snapshot to verify host view of scores and teams.
+            GameSettings *gsDbg = gameGetSettings();
+            if (gsDbg) {
+                int p;
+                for (p = 0; p < GAME_MAX_PLAYERS; ++p) {
+                    if (!gsDbg->PlayerNames[p][0])
+                        continue;
+                    int team = gsDbg->PlayerTeams[p];
+                    char dbgName[KOTH_NAME_MAX_LEN + 1];
+                    kothCopyName(dbgName, gsDbg->PlayerNames[p]);
+                    KOTH_LOG("[KOTH][DBG] scoreboard idx=%d team=%d name=%s score=%d\n", p, team, dbgName, kothScores[p]);
+                }
+            }
+            if (!isTie && leaderIdx >= 0) {
+                KOTH_LOG("[KOTH][DBG] timer expire would set winner idx=%d reason=%d (TEAM_WIN)\n", leaderIdx, GAME_END_TEAM_WIN);
+            } else if (leaderIdx < 0) {
+                KOTH_LOG("[KOTH][DBG] timer expired but no leader found\n");
+            } else {
+                // TODO: decide tie behavior (end game without winner vs. wait for hook)
+            }
+#endif
+        }
+        if (timeLeft <= 0)
+            return;
+    }
+
     if (leaderIdx < 0)
         return;
 
@@ -379,39 +536,6 @@ static void kothCheckVictory(void)
         kothDeclareWinner(leaderIdx, GAME_END_TEAM_WIN);
         return;
     }
-
-    int timerActive = (gd->timeStart > 0) && (gd->timeEnd > gd->timeStart);
-    if (timerActive && gameGetTime() >= gd->timeEnd && !isTie) {
-        // Force the timer outcome to be authoritative (even if the base game already fired end-game once).
-        // This mirrors how patchSiegeTimeUp immediately ends the game with its own winner.
-        kothSetWinnerFields(leaderIdx, GAME_END_TIME_UP, 0);
-        gameEnd(GAME_END_TIME_UP);
-    }
-}
-
-int kothHandleTimeUp(int reason)
-{
-    if (reason != GAME_END_TIME_UP)
-        return 0;
-    if (!gameAmIHost())
-        return 0;
-
-    GameData *gd = gameGetData();
-    if (!gd)
-        return 0;
-
-    int timerActive = (gd->timeStart > 0) && (gd->timeEnd > gd->timeStart);
-    if (!timerActive)
-        return 0;
-
-    int leaderScore = 0;
-    int isTie = 0;
-    int leaderIdx = kothFindLeader(&leaderScore, &isTie);
-    if (leaderIdx < 0 || isTie)
-        return 0;
-
-    kothSetWinnerFields(leaderIdx, GAME_END_TIME_UP, 1);
-    return 1;
 }
 
 static void drawHillAt(VECTOR center, u32 color, float *scroll)
@@ -685,7 +809,7 @@ static void drawHud(void)
     float startX = 20;
     float startY = SCREEN_HEIGHT * 0.35f;
     float lineH = 16.0f;
-    gfxScreenSpaceText(startX, startY - lineH, 1, 1, 0x80FFFFFF, "KOTH", -1, TEXT_ALIGN_TOPLEFT, FONT_BOLD);
+    gfxScreenSpaceText(startX, startY - lineH, 1, 1, 0x80FFFFFF, kothTitle, -1, TEXT_ALIGN_TOPLEFT, FONT_BOLD);
 
     int i;
     for (i = 0; i < count; ++i) {
@@ -700,7 +824,9 @@ static void drawHud(void)
             snprintf(line, sizeof(line), "%s: %d", name, entries[i].score);
             color = (0x80 << 24) | ((idx >= 0 && idx < TEAM_MAX) ? TEAM_COLORS[idx] : 0x00FFFFFF);
         } else {
-            snprintf(line, sizeof(line), "%s: %d", gs->PlayerNames[idx], entries[i].score);
+            char nameBuf[KOTH_NAME_MAX_LEN + 1];
+            kothCopyName(nameBuf, gs->PlayerNames[idx]);
+            snprintf(line, sizeof(line), "%s: %d", nameBuf, entries[i].score);
             int team = gs->PlayerTeams[idx];
             color = (0x80 << 24) | ((team >= 0 && team < 8) ? TEAM_COLORS[team] : 0x00FFFFFF);
         }
@@ -723,12 +849,15 @@ void kothReset(void)
 {
     initialized = 0;
     handlerInstalled = 0;
+    gameEndHookInstalled = 0;
     hillCount = 0;
     nextScoreTickTime = 0;
     gameOverTriggered = 0;
+    gameEndHandled = 0;
     hillCycleStartTime = 0;
 #ifdef KOTH_RANDOM_ORDER
     hillOrderCount = 0;
+    ++hillOrderShuffleNonce;
 #endif
     memset(hills, 0, sizeof(hills));
     memset(kothScores, 0, sizeof(kothScores));
@@ -746,6 +875,25 @@ void kothInit(void)
     GameOptions *go = gameGetOptions();
     if (go) {
         go->GameFlags.MultiplayerGameFlags.FragLimit = 0;
+    }
+
+    // Cache header text for HUD.
+    int scoreLimit = kothGetScoreLimit();
+    if (scoreLimit > 0)
+        snprintf(kothTitle, sizeof(kothTitle), "%d", scoreLimit);
+    else
+        snprintf(kothTitle, sizeof(kothTitle), "No limit");
+
+    if (!gameEndHookInstalled) {
+        // Choose callsite table based on teams flag; fallback to teams table if FFA entry missing.
+        VariableAddress_t *hookTable = go && go->GameFlags.MultiplayerGameFlags.Teams ? &vaGameTimerEndHookDmTeams : &vaGameTimerEndHookDmNoTeams;
+        u32 hook = GetAddress(hookTable);
+        if (!hook && hookTable != &vaGameTimerEndHookDmTeams)
+            hook = GetAddress(&vaGameTimerEndHookDmTeams);
+        if (hook) {
+            HOOK_JAL(hook, &runGameEnd);
+            gameEndHookInstalled = 1;
+        }
     }
 
     scanHillsOnce();
@@ -766,6 +914,23 @@ void kothTick(void)
 
     if (gameTime >= nextScoreTickTime) {
         updateScores();
+#ifdef KOTH_DEBUG
+        // KOTHDBUG: trace timer every tick (host only) to see countdown activity
+        if (gameAmIHost()) {
+            GameData *gd = gameGetData();
+            int hasGd = gd != NULL;
+            int startSet = gd && (gd->timeStart > 0);
+            int endSet = gd && (gd->timeEnd > 0);
+            // Treat timeEnd as a duration in ms from timeStart (base game may store duration, not absolute end).
+            int resolvedEnd = (startSet && endSet) ? (gd->timeStart + gd->timeEnd) : -1;
+            int endAfterStart = resolvedEnd > (startSet ? gd->timeStart : 0);
+            int timerActive = hasGd && startSet && endAfterStart;
+            int timeStart = gd ? gd->timeStart : -1;
+            int timeEnd = gd ? gd->timeEnd : -1;
+            int timeLeft = timerActive ? (resolvedEnd - gameTime) : -1;
+            KOTH_LOG("[KOTH][DBG] tick timerActive=%d timeNow=%d hasGd=%d startSet=%d endSet=%d endAfterStart=%d timeStart=%d timeEnd=%d resolvedEnd=%d timeLeft=%d\n", timerActive, gameTime, hasGd, startSet, endSet, endAfterStart, timeStart, timeEnd, resolvedEnd, timeLeft);
+        }
+#endif
         nextScoreTickTime = gameTime + KOTH_SCORE_TICK_MS;
     }
 
