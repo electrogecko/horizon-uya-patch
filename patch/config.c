@@ -275,12 +275,13 @@ const int dataCustomMapsWithExclusiveGameModeCount = sizeof(dataCustomMapsWithEx
 MenuElem_OrderedListData_t dataCustomModes = {
   .value = &gameConfig.grCustomModeId,
   .stateHandler = menuStateHandler_SelectedGameModeOverride,
-  .count = 3,
+  .count = 4,
   .items = {
     {CUSTOM_MODE_NONE, "None"},
     // {CUSTOM_MODE_INFECTED, "Infected"},
     // {CUSTOM_MODE_JUGGERNAUGHT, "Juggernaut"},
     {CUSTOM_MODE_MIDFLAG, "MidFlag"},
+    {CUSTOM_MODE_DOMINATION, "Domination"},
     {CUSTOM_MODE_KOTH, "King of the Hill"},
   }
 };
@@ -293,6 +294,7 @@ const char* CustomModeShortNames[] = {
   // [CUSTOM_MODE_INFECTED] "Infected",
   // [CUSTOM_MODE_JUGGERNAUGHT] NULL,
   [CUSTOM_MODE_MIDFLAG] NULL,
+  [CUSTOM_MODE_DOMINATION] "Dom",
   [CUSTOM_MODE_KOTH] "KOTH"
 };
 

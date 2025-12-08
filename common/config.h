@@ -25,6 +25,7 @@ typedef struct PatchConfig {
   char disableDpadMovement;
   char hideFluxReticle;
   char dlStyleFlips;
+  char enableTeamInfo;
 } PatchConfig_t;
 
 // Game Rules Tab
@@ -129,7 +130,8 @@ enum CUSTOM_MODE_ID {
   // CUSTOM_MODE_INFECTED,
   // CUSTOM_MODE_JUGGERNAUGHT,
   CUSTOM_MODE_MIDFLAG = 1,
-  CUSTOM_MODE_KOTH = 4,
+  CUSTOM_MODE_DOMINATION = 4,
+  CUSTOM_MODE_KOTH = 5,
   // always at the end to indicate how many items there are
   CUSTOM_MODE_COUNT
 };

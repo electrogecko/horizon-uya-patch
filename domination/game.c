@@ -20,6 +20,8 @@
 #include <libuya/gameplay.h>
 #include <libuya/guber.h>
 #include <libuya/sound.h>
+#include "../common/config.h"
+#include "include/game.h"
 
 #define MAX_SEGMENTS                        (64)
 #define MIN_SEGMENTS                        (8)
@@ -538,19 +540,50 @@ Moby *spawnBaseMobies(Moby *node, Moby *boltCrank)
     return moby;
 }
 
-void domination(void)
+void onGameplayLoad_adjustSiegePadTies(GameplayHeaderDef_t * gameplay, float targetZ)
 {
-	if (!isInGame()) {
-        domInfo.gameState = 0;
+	if (!gameplay || !gameplay->TieInstancesOffset)
 		return;
-    }
 
+	TieInstanceTableHeader_t * header = (TieInstanceTableHeader_t*)((u8*)gameplay + gameplay->TieInstancesOffset);
+	int count = header->Count;
+	if (count <= 0 || count > 4096)
+		return;
+
+	TieInstanceEntry_t * entries = (TieInstanceEntry_t*)((u8*)header + sizeof(TieInstanceTableHeader_t));
+	int i;
+	for (i = 0; i < count; ++i) {
+		if (entries[i].OClass == MOBY_ID_SIEGE_PAD_TIE)
+			entries[i].Matrix[3][2] = targetZ;
+	}
+}
+
+void gameTick(void)
+{
 	if (domInfo.gameState == 0) {
-        memset(&domInfo, 0, sizeof(DominationInfo_t));
 		getBases();
 		domInfo.gameState = 1;
 		domInfo.baseRaddius = BASE_RADIUS;
 	}
 
     drawDominationHud();
+}
+
+void initialize(PatchGameConfig_t* gameConfig)
+{
+	// hook messages
+	// netHookMessages();
+
+	memset(&domInfo, 0, sizeof(DominationInfo_t));
+
+	// give a 1 second delay before finalizing the initialization.
+	// this helps prevent the slow loaders from desyncing
+	static int startDelay = 60 * 2;
+	if (startDelay > 0) {
+		--startDelay;
+		return;
+	}
+
+	// finalize initialization
+	State.Initialized = 1;
 }
