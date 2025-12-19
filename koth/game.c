@@ -27,6 +27,10 @@
 #include "config.h"
 #include "include/koth.h"
 
+#ifndef DEBUG
+#define DEBUG 1
+#endif
+
 #define HILL_OCLASS (0x3000)
 #define MAX_SEGMENTS (64)
 #define MIN_SEGMENTS (4)
@@ -36,6 +40,12 @@
 #define TEXTURE_EDGE_TRIM_V (0.25f)
 #define KOTH_HILL_SCALE_BITS (0xF)
 #define KOTH_DEFAULT_HILL_DURATION_SECONDS (60)
+
+#ifdef DEBUG
+#define KOTH_LOG(...) printf(__VA_ARGS__)
+#else
+#define KOTH_LOG(...)
+#endif
 
 int spawned = 0;
 /* Prepare arrays for strip vertices */
@@ -56,6 +66,8 @@ kothInfo_t kothInfo;
 
 typedef struct hillPvar {
     int cuboidIndex[32];
+    int cuboidCount;
+    int cuboidCursor;
     bool foundMoby;
     bool isCircle;
     short pad;
@@ -63,6 +75,7 @@ typedef struct hillPvar {
     Cuboid* currentCuboid;
     int teamTime[8];
     u32 color;
+    Cuboid activeCuboid;
 } hillPvar_t;
 
 static const float KOTH_HILL_SCALE_TABLE[] = { 1.f, 1.5f, 2.f, 2.5f, 3.f, 3.5f, 4.f };
@@ -80,6 +93,13 @@ static KothRuntimeConfig_t kothConfig = {
     .hillDurationMs = KOTH_DEFAULT_HILL_DURATION_SECONDS * TIME_SECOND,
     .hillScale = 1.f
 };
+
+static Moby* mapHillMoby = NULL;
+static int lastTimeStart = -1;
+static int lastSeed = -1;
+static int currentSeed = 0;
+static PatchGameConfig_t kothConfigCache;
+static int hasConfigCache = 0;
 
 static const Cuboid HILL_CUBOID_TEMPLATE = {
     .matrix = {
@@ -110,6 +130,75 @@ static void kothUpdateHillScale(float scale)
     rawr.matrix.v1[1] *= scale;
     cachedSegments = -1;
     cachedIsCircle = -1;
+}
+
+static int hillEnumerateSpawnCuboids(hillPvar_t* pvars)
+{
+    if (!pvars)
+        return 0;
+
+    int spCount = spawnPointGetCount();
+    int count = 0;
+    int i;
+    for (i = 0; i < spCount && count < COUNT_OF(pvars->cuboidIndex); ++i) {
+        if (!spawnPointIsPlayer(i))
+            continue;
+
+        pvars->cuboidIndex[count++] = i;
+    }
+
+    pvars->cuboidCount = count;
+    return count;
+}
+
+static int hillTryUseMobyCuboid(hillPvar_t* pvars, Moby* moby, const char** outLabel)
+{
+    if (!pvars || !moby || !moby->pVar)
+        return 0;
+
+    int* ids = (int*)moby->pVar;
+    if ((u32)ids < 0x10000)
+        return 0;
+
+    int count = 0;
+    int pickedIdx = -1;
+    int i;
+    for (i = 0; i < COUNT_OF(pvars->cuboidIndex); ++i) {
+        int idx = ids[i];
+        if (idx < 0)
+            continue;
+        Cuboid* c = spawnPointGet(idx);
+        if (!c)
+            continue;
+        if (count < (int)COUNT_OF(pvars->cuboidIndex))
+            pvars->cuboidIndex[count] = idx;
+        if (pickedIdx < 0)
+            pickedIdx = idx;
+        ++count;
+    }
+
+    pvars->cuboidCount = count;
+    if (count > 0)
+        pvars->cuboidCursor = 0;
+    if (count > 0 && pickedIdx >= 0) {
+        Cuboid* src = spawnPointGet(pickedIdx);
+        if (src) {
+            pvars->activeCuboid = *src;
+            pvars->currentCuboid = &pvars->activeCuboid;
+            pvars->isCircle = vector_length(src->matrix.v2) > 1.0001f;
+            if (outLabel)
+                *outLabel = "moby-cuboid-list";
+            static int logged = 0;
+            if (!logged) {
+                KOTH_LOG("\nhillTryUseMobyCuboid: accept moby=%08x cuboids=%d firstIdx=%d pos=%d,%d,%d",
+                         moby, count, pickedIdx, (int)src->pos[0], (int)src->pos[1], (int)src->pos[2]);
+                logged = 1;
+            }
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 int hillCheckIfInside(Cuboid cube, VECTOR playerPos, char isCircle)
@@ -159,6 +248,9 @@ void hillPlayerUpdates(Moby* this)
     if (!gs)
         return;
 
+    if (!pvar || !pvar->currentCuboid || (u32)pvar->currentCuboid < 0x10000)
+        return;
+
     int playerCount = gs->PlayerCount;
     int i;
     for (i = 0; i < playerCount; ++i) {
@@ -167,7 +259,6 @@ void hillPlayerUpdates(Moby* this)
             continue;
 
         int in = hillCheckIfInside(*pvar->currentCuboid, player->playerPosition, pvar->isCircle);
-        printf("\ninside hill: %d", in);
         if (in) {
             pvar->color = TEAM_COLORS[player->mpTeam];
         }
@@ -385,9 +476,12 @@ void circleMeFinal_StripMe(Moby* this, Cuboid cube)
 
     /* === Calculate distance-based opacity === */
     Player* player = playerGetFromSlot(0);
-    VECTOR delta;
-    vector_subtract(delta, center, player->playerPosition);
-    float distance = vector_length(delta);
+    float distance = 0.f;
+    if (player) {
+        VECTOR delta;
+        vector_subtract(delta, center, player->playerPosition);
+        distance = vector_length(delta);
+    }
 
     float opacityFactor = 1.0f;
     // if (distance > 52.0f) {
@@ -490,8 +584,18 @@ static void hill_drawShape(Moby* moby, Cuboid cube)
 void hill_postDraw(Moby* moby)
 {
     hillPvar_t* pvars = (hillPvar_t*)moby->pVar;
-    if (!pvars)
+    if (!pvars || !pvars->currentCuboid || (u32)pvars->currentCuboid < 0x10000)
         return;
+
+    static int lastRenderLogTime = -TIME_SECOND;
+    int now = gameGetTime();
+    if (now - lastRenderLogTime >= TIME_SECOND) {
+        lastRenderLogTime = now;
+        int px = (int)pvars->currentCuboid->pos[0];
+        int py = (int)pvars->currentCuboid->pos[1];
+        int pz = (int)pvars->currentCuboid->pos[2];
+        KOTH_LOG("\nhill_postDraw: pvars=%08x cuboid=%08x pos=%d,%d,%d circle=%d", pvars, pvars->currentCuboid, px, py, pz, pvars->isCircle);
+    }
 
     if (vector_length(pvars->currentCuboid->matrix.v2) > 1.0001)
         pvars->isCircle = 1;
@@ -501,18 +605,90 @@ void hill_postDraw(Moby* moby)
 
 void hill_update(Moby* moby)
 {
-    printf("\nhill_update: start");
+    static int lastLogTime = -TIME_SECOND;
     hillPvar_t* pvars = (hillPvar_t*)moby->pVar;
     if (!pvars)
         return;
 
-    if (!pvars->currentCuboid) {
-        pvars->currentCuboid = &rawr;
+    Cuboid* chosen = NULL;
+    const char* chosenLabel = NULL;
+
+    // If map had a baked hill moby, prefer its cuboid.
+    Moby* mapMoby = mapHillMoby;
+    Moby* listStart = mobyListGetStart();
+    Moby* listEnd = mobyListGetEnd();
+    if (mapMoby && (mapMoby < listStart || mapMoby >= listEnd || mapMoby == moby)) {
+        KOTH_LOG("\nhill_update: drop mapHillMoby (invalid or self) mapMoby=%08x self=%08x", mapMoby, moby);
+        mapMoby = NULL;
+        mapHillMoby = NULL;
+    }
+    if (!chosen && mapMoby && hillTryUseMobyCuboid(pvars, mapMoby, &chosenLabel)) {
+        chosen = pvars->currentCuboid;
+    }
+
+    // Prefer a cuboid baked into the hill moby if present.
+    if (hillTryUseMobyCuboid(pvars, moby, &chosenLabel)) {
+        chosen = pvars->currentCuboid;
+    }
+
+    // Try pre-identified hill cuboid first (if any were stored later)
+    if (!chosen && pvars->foundMoby && pvars->cuboidCount > 0) {
+        chosen = spawnPointGet(pvars->cuboidIndex[0]);
+        chosenLabel = "hill-list";
+    }
+
+    // If no explicit hill cuboid, fall back to spawn cuboids
+    if (!chosen) {
+        if (!pvars->cuboidCount) {
+            hillEnumerateSpawnCuboids(pvars);
+        }
+
+        if (pvars->cuboidCount > 0) {
+            chosen = spawnPointGet(pvars->cuboidIndex[0]);
+        chosenLabel = "spawn-cuboid";
+        }
+    }
+
+    // Final fallback to default baked hill
+    if (!chosen) {
+        chosen = &rawr;
+        chosenLabel = "rawr-default";
+    }
+
+    // Build a safe, local copy of the cuboid to avoid bad pointers.
+    Cuboid local = rawr;
+    if (chosen) {
+        local = *chosen;
+    }
+
+    // If we came from spawn cuboids, force a circular hill at the rawr size centered on the spawn.
+    if (chosenLabel && !strcmp(chosenLabel, "spawn-cuboid") && chosen) {
+        local = rawr;
+        vector_copy(local.pos, chosen->pos);
+        // flag as circle by making v2 large
+        local.matrix.v2[2] = 2.f;
+        pvars->isCircle = 1;
+    }
+
+    pvars->activeCuboid = local;
+    pvars->currentCuboid = &pvars->activeCuboid;
+
+    if (!pvars->currentCuboid || (u32)pvars->currentCuboid < 0x10000) {
+        pvars->activeCuboid = rawr;
+        pvars->currentCuboid = &pvars->activeCuboid;
+        chosenLabel = "rawr-safety";
     }
 
     vector_copy(moby->position, pvars->currentCuboid->pos);
 
-    printf("\ncuboid: %08x, pos: %d", pvars->currentCuboid, pvars->currentCuboid->pos[0]);
+    int now = gameGetTime();
+    if (now - lastLogTime >= TIME_SECOND) {
+        lastLogTime = now;
+        int posX = (int)pvars->currentCuboid->pos[0];
+        int posY = (int)pvars->currentCuboid->pos[1];
+        int posZ = (int)pvars->currentCuboid->pos[2];
+        KOTH_LOG("\nhill_update: cuboid=%08x (%s) pos=%d,%d,%d count=%d", pvars->currentCuboid, chosenLabel ? chosenLabel : "unknown", posX, posY, posZ, pvars->cuboidCount);
+    }
 
     gfxRegisterDrawFunction(&hill_postDraw, moby);
 
@@ -527,29 +703,41 @@ void hill_update(Moby* moby)
 
 void hill_setupMoby(void)
 {
-    Moby* moby = getHillMoby();
-    if (moby == 0) {
-        moby = mobySpawn(HILL_OCLASS, sizeof(hillPvar_t));
+    Moby* existing = getHillMoby();
+    mapHillMoby = existing;
+    if (existing) {
+        KOTH_LOG("\nhill_setupMoby: ignoring existing moby=%08x", existing);
     }
+
+    Moby* moby = mobySpawn(HILL_OCLASS, sizeof(hillPvar_t));
     if (!moby) return;
 
-    printf("\nmoby: %08x", moby);
+    KOTH_LOG("\nmoby: %08x", moby);
 
     hillPvar_t* pvars = (hillPvar_t*)moby->pVar;
     memset(pvars, 0, sizeof(hillPvar_t));
-    pvars->currentCuboid = &rawr;
+    pvars->currentCuboid = &pvars->activeCuboid;
+    pvars->activeCuboid = rawr;
     pvars->color = 0x00ffffff;
+    pvars->cuboidCount = 0;
+    KOTH_LOG("\nhill_setupMoby: pvars=%08x cleared", pvars);
 
     moby->pUpdate = &hill_update;
-    moby->modeBits = 0;
+    moby->modeBits = MOBY_MODE_BIT_HIDDEN; // hide native model but allow updates/draw callback
     moby->updateDist = -1;
     moby->drawn = 1;
     moby->opacity = 0;
     moby->drawDist = 0;
     vector_copy(moby->position, rawr.pos);
 
+    hillAttachFallbackClass(moby);
+
     soundPlayByOClass(1, 0, moby, MOBY_ID_OMNI_SHIELD);
     kothInfo.kothMoby = moby;
+    KOTH_LOG("\nhill_setupMoby: complete moby=%08x", moby);
+
+    // Reset rotation cursor on new spawn.
+    pvars->cuboidCursor = 0;
 }
 
 Moby* getHillMoby(void)
@@ -565,6 +753,46 @@ Moby* getHillMoby(void)
         ++moby;
     }
     return 0;
+}
+
+static void hillAttachFallbackClass(Moby* moby)
+{
+    if (!moby)
+        return;
+
+    if (moby->pClass)
+        return;
+
+    Moby* cur = mobyListGetStart();
+    Moby* end = mobyListGetEnd();
+    Moby* source = NULL;
+
+    // Prefer an omni shield class if present.
+    while ((cur = mobyFindNextByOClass(cur, MOBY_ID_OMNI_SHIELD))) {
+        if (cur->pClass) {
+            source = cur;
+            break;
+        }
+    }
+
+    // Otherwise pick the first moby with a class.
+    if (!source) {
+        cur = mobyListGetStart();
+        while (cur < end) {
+            if (cur->pClass) {
+                source = cur;
+                break;
+            }
+            ++cur;
+        }
+    }
+
+    if (source) {
+        moby->pClass = source->pClass;
+        KOTH_LOG("\nhill_attach_class: adopted class=%08x from moby=%08x", moby->pClass, source);
+    } else {
+        KOTH_LOG("\nhill_attach_class: no source class found");
+    }
 }
 
 static int clampIndex(int idx, int max)
@@ -585,7 +813,11 @@ void kothReset(void)
     scrollQuad = 0;
     cachedSegments = -1;
     cachedIsCircle = -1;
+    mapHillMoby = NULL;
+    lastTimeStart = -1;
+    lastSeed = -1;
     kothUpdateHillScale(kothConfig.hillScale);
+    KOTH_LOG("\nkothReset: state cleared");
 }
 
 void kothSetConfig(PatchGameConfig_t* config)
@@ -593,6 +825,11 @@ void kothSetConfig(PatchGameConfig_t* config)
     int scoreIdx = config ? config->grKothScoreLimit : 0;
     int durationIdx = config ? config->grKothHillDuration : 0;
     int sizeIdx = config ? ((config->grSeed >> 28) & KOTH_HILL_SCALE_BITS) : 0;
+    currentSeed = config ? (config->grSeed & 0x0FFFFFFF) : 0;
+    if (config) {
+        kothConfigCache = *config;
+        hasConfigCache = 1;
+    }
 
     scoreIdx = clampIndex(scoreIdx, COUNT_OF(KOTH_SCORE_LIMIT_TABLE));
     durationIdx = clampIndex(durationIdx, COUNT_OF(KOTH_HILL_DURATION_TABLE));
@@ -603,10 +840,12 @@ void kothSetConfig(PatchGameConfig_t* config)
     kothConfig.hillScale = KOTH_HILL_SCALE_TABLE[sizeIdx];
 
     kothUpdateHillScale(kothConfig.hillScale);
+    KOTH_LOG("\nkothSetConfig: score=%d durationMs=%d scaleIdx=%d", kothConfig.scoreLimit, kothConfig.hillDurationMs, sizeIdx);
 
     if (kothInfo.kothMoby && kothInfo.kothMoby->pVar) {
         hillPvar_t* pvars = (hillPvar_t*)kothInfo.kothMoby->pVar;
-        pvars->currentCuboid = &rawr;
+        pvars->activeCuboid = rawr;
+        pvars->currentCuboid = &pvars->activeCuboid;
         vector_copy(kothInfo.kothMoby->position, rawr.pos);
     }
 }
@@ -615,10 +854,22 @@ void kothTick(void)
 {
     GameSettings* gs = gameGetSettings();
     GameData* gd = gameGetData();
+    int timeStart = gd ? gd->timeStart : -1;
+    int seedNow = currentSeed;
 
     // only continue if enabled and in game
     if (!isInGame() || !gs || !gd) {
         return;
+    }
+
+    // Detect new match via timeStart or seed change; reset and reapply config.
+    if (timeStart > 0 && (timeStart != lastTimeStart || seedNow != lastSeed)) {
+        kothReset();
+        if (hasConfigCache) {
+            kothSetConfig(&kothConfigCache);
+        }
+        lastTimeStart = timeStart;
+        lastSeed = seedNow;
     }
 
     if (!kothInfo.kothMoby) {
