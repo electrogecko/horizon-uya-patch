@@ -7,5 +7,6 @@
 void kothSetConfig(PatchGameConfig_t *config);
 void kothReset(void);
 void kothTick(void);
+void kothShutdown(void);
 
 #endif // KOTH_H

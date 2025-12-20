@@ -95,6 +95,7 @@ static KothRuntimeConfig_t kothConfig = {
 };
 
 static Moby* mapHillMoby = NULL;
+static int kothReady = 0;
 static int lastTimeStart = -1;
 static int lastSeed = -1;
 static int currentSeed = 0;
@@ -156,17 +157,28 @@ static int hillTryUseMobyCuboid(hillPvar_t* pvars, Moby* moby, const char** outL
     if (!pvars || !moby || !moby->pVar)
         return 0;
 
+    // Only treat the RC hill moby layout (oclass 0x3000) as a cuboid-ref table.
+    // Avoid reading our own spawned hill moby, whose pVar is a different struct.
+    if (moby->oClass != HILL_OCLASS || moby == kothInfo.kothMoby)
+        return 0;
+
     int* ids = (int*)moby->pVar;
     if ((u32)ids < 0x10000)
         return 0;
 
     int count = 0;
+    int spawnCount = spawnPointGetCount();
     int pickedIdx = -1;
     int i;
     for (i = 0; i < COUNT_OF(pvars->cuboidIndex); ++i) {
         int idx = ids[i];
+        // Treat negative entries as sentinel/end of list.
         if (idx < 0)
+            break;
+        // Ignore out-of-range spawn references.
+        if (idx >= spawnCount)
             continue;
+
         Cuboid* c = spawnPointGet(idx);
         if (!c)
             continue;
@@ -178,8 +190,10 @@ static int hillTryUseMobyCuboid(hillPvar_t* pvars, Moby* moby, const char** outL
     }
 
     pvars->cuboidCount = count;
-    if (count > 0)
+    if (count > 0) {
         pvars->cuboidCursor = 0;
+        pvars->foundMoby = 1; // cache that we already parsed a valid cuboid list
+    }
     if (count > 0 && pickedIdx >= 0) {
         Cuboid* src = spawnPointGet(pickedIdx);
         if (src) {
@@ -622,6 +636,11 @@ void hill_update(Moby* moby)
         mapMoby = NULL;
         mapHillMoby = NULL;
     }
+    if (mapMoby && mapMoby->oClass != HILL_OCLASS) {
+        KOTH_LOG("\nhill_update: drop mapHillMoby (oclass mismatch) mapMoby=%08x oClass=%x", mapMoby, mapMoby->oClass);
+        mapMoby = NULL;
+        mapHillMoby = NULL;
+    }
     if (!chosen && mapMoby && hillTryUseMobyCuboid(pvars, mapMoby, &chosenLabel)) {
         chosen = pvars->currentCuboid;
     }
@@ -814,10 +833,21 @@ void kothReset(void)
     cachedSegments = -1;
     cachedIsCircle = -1;
     mapHillMoby = NULL;
+    kothReady = 0;
     lastTimeStart = -1;
     lastSeed = -1;
     kothUpdateHillScale(kothConfig.hillScale);
     KOTH_LOG("\nkothReset: state cleared");
+}
+
+void kothShutdown(void)
+{
+    if (kothInfo.kothMoby) {
+        kothInfo.kothMoby->pUpdate = NULL;
+        kothInfo.kothMoby = NULL;
+    }
+    mapHillMoby = NULL;
+    kothReady = 0;
 }
 
 void kothSetConfig(PatchGameConfig_t* config)
@@ -859,6 +889,7 @@ void kothTick(void)
 
     // only continue if enabled and in game
     if (!isInGame() || !gs || !gd) {
+        kothReady = 0;
         return;
     }
 
@@ -875,4 +906,7 @@ void kothTick(void)
     if (!kothInfo.kothMoby) {
         hill_setupMoby();
     }
+
+    // Mark ready once config is applied and hill moby is spawned.
+    kothReady = 1;
 }
