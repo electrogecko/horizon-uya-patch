@@ -96,6 +96,7 @@ static KothRuntimeConfig_t kothConfig = {
 
 static Moby* mapHillMoby = NULL;
 static int kothReady = 0;
+static void* hillClassCache = NULL;
 static int lastTimeStart = -1;
 static int lastSeed = -1;
 static int currentSeed = 0;
@@ -124,6 +125,9 @@ static Cuboid rawr = {
     .rot = {0, 0, 0, 0}
 };
 
+static Moby* getHillMoby(void);
+
+
 static void kothUpdateHillScale(float scale)
 {
     rawr = HILL_CUBOID_TEMPLATE;
@@ -150,6 +154,22 @@ static int hillEnumerateSpawnCuboids(hillPvar_t* pvars)
 
     pvars->cuboidCount = count;
     return count;
+}
+
+static int cuboidIsValid(const Cuboid* c)
+{
+    if (!c)
+        return 0;
+    if ((u32)c < 0x10000)
+        return 0;
+    float len0 = vector_length((float*)c->matrix.v0);
+    float len1 = vector_length((float*)c->matrix.v1);
+    float len2 = vector_length((float*)c->matrix.v2);
+    if (len0 != len0 || len1 != len1 || len2 != len2)
+        return 0;
+    if (len0 < 0.01f || len1 < 0.01f || len2 < 0.01f)
+        return 0;
+    return 1;
 }
 
 static int hillTryUseMobyCuboid(hillPvar_t* pvars, Moby* moby, const char** outLabel)
@@ -180,7 +200,8 @@ static int hillTryUseMobyCuboid(hillPvar_t* pvars, Moby* moby, const char** outL
             continue;
 
         Cuboid* c = spawnPointGet(idx);
-        if (!c)
+        //if (!c || !cuboidIsValid(c))
+		if (!c)
             continue;
         if (count < (int)COUNT_OF(pvars->cuboidIndex))
             pvars->cuboidIndex[count] = idx;
@@ -619,6 +640,7 @@ void hill_postDraw(Moby* moby)
 
 void hill_update(Moby* moby)
 {
+
     static int lastLogTime = -TIME_SECOND;
     hillPvar_t* pvars = (hillPvar_t*)moby->pVar;
     if (!pvars)
@@ -626,8 +648,6 @@ void hill_update(Moby* moby)
 
     Cuboid* chosen = NULL;
     const char* chosenLabel = NULL;
-
-    // If map had a baked hill moby, prefer its cuboid.
     Moby* mapMoby = mapHillMoby;
     Moby* listStart = mobyListGetStart();
     Moby* listEnd = mobyListGetEnd();
@@ -644,54 +664,39 @@ void hill_update(Moby* moby)
     if (!chosen && mapMoby && hillTryUseMobyCuboid(pvars, mapMoby, &chosenLabel)) {
         chosen = pvars->currentCuboid;
     }
-
-    // Prefer a cuboid baked into the hill moby if present.
     if (hillTryUseMobyCuboid(pvars, moby, &chosenLabel)) {
         chosen = pvars->currentCuboid;
     }
-
-    // Try pre-identified hill cuboid first (if any were stored later)
     if (!chosen && pvars->foundMoby && pvars->cuboidCount > 0) {
         chosen = spawnPointGet(pvars->cuboidIndex[0]);
         chosenLabel = "hill-list";
     }
-
-    // If no explicit hill cuboid, fall back to spawn cuboids
     if (!chosen) {
         if (!pvars->cuboidCount) {
             hillEnumerateSpawnCuboids(pvars);
         }
-
         if (pvars->cuboidCount > 0) {
             chosen = spawnPointGet(pvars->cuboidIndex[0]);
         chosenLabel = "spawn-cuboid";
         }
     }
-
-    // Final fallback to default baked hill
     if (!chosen) {
         chosen = &rawr;
         chosenLabel = "rawr-default";
     }
-
-    // Build a safe, local copy of the cuboid to avoid bad pointers.
+    // For now, use the baked hill cuboid only (cache is built but not consumed).
     Cuboid local = rawr;
     if (chosen) {
         local = *chosen;
     }
-
-    // If we came from spawn cuboids, force a circular hill at the rawr size centered on the spawn.
     if (chosenLabel && !strcmp(chosenLabel, "spawn-cuboid") && chosen) {
         local = rawr;
         vector_copy(local.pos, chosen->pos);
-        // flag as circle by making v2 large
         local.matrix.v2[2] = 2.f;
         pvars->isCircle = 1;
     }
-
     pvars->activeCuboid = local;
     pvars->currentCuboid = &pvars->activeCuboid;
-
     if (!pvars->currentCuboid || (u32)pvars->currentCuboid < 0x10000) {
         pvars->activeCuboid = rawr;
         pvars->currentCuboid = &pvars->activeCuboid;
@@ -706,7 +711,7 @@ void hill_update(Moby* moby)
         int posX = (int)pvars->currentCuboid->pos[0];
         int posY = (int)pvars->currentCuboid->pos[1];
         int posZ = (int)pvars->currentCuboid->pos[2];
-        KOTH_LOG("\nhill_update: cuboid=%08x (%s) pos=%d,%d,%d count=%d", pvars->currentCuboid, chosenLabel ? chosenLabel : "unknown", posX, posY, posZ, pvars->cuboidCount);
+        KOTH_LOG("\nhill_update: cuboid=%p pos=%d,%d,%d", pvars->currentCuboid, posX, posY, posZ);
     }
 
     gfxRegisterDrawFunction(&hill_postDraw, moby);
@@ -725,10 +730,14 @@ void hill_setupMoby(void)
     Moby* existing = getHillMoby();
     mapHillMoby = existing;
     if (existing) {
-        KOTH_LOG("\nhill_setupMoby: ignoring existing moby=%08x", existing);
+        KOTH_LOG("\nhill_setupMoby: ignoring existing moby=%08x pClass=%p", existing, existing->pClass);
+        if (existing->pClass)
+            hillClassCache = existing->pClass;
     }
 
-    Moby* moby = mobySpawn(HILL_OCLASS, sizeof(hillPvar_t));
+    //Moby* moby = mobySpawn(HILL_OCLASS, sizeof(hillPvar_t));
+	Moby* moby = mobySpawn(0x1c0d, sizeof(hillPvar_t));
+	
     if (!moby) return;
 
     KOTH_LOG("\nmoby: %08x", moby);
@@ -749,7 +758,6 @@ void hill_setupMoby(void)
     moby->drawDist = 0;
     vector_copy(moby->position, rawr.pos);
 
-    hillAttachFallbackClass(moby);
 
     soundPlayByOClass(1, 0, moby, MOBY_ID_OMNI_SHIELD);
     kothInfo.kothMoby = moby;
@@ -774,46 +782,6 @@ Moby* getHillMoby(void)
     return 0;
 }
 
-static void hillAttachFallbackClass(Moby* moby)
-{
-    if (!moby)
-        return;
-
-    if (moby->pClass)
-        return;
-
-    Moby* cur = mobyListGetStart();
-    Moby* end = mobyListGetEnd();
-    Moby* source = NULL;
-
-    // Prefer an omni shield class if present.
-    while ((cur = mobyFindNextByOClass(cur, MOBY_ID_OMNI_SHIELD))) {
-        if (cur->pClass) {
-            source = cur;
-            break;
-        }
-    }
-
-    // Otherwise pick the first moby with a class.
-    if (!source) {
-        cur = mobyListGetStart();
-        while (cur < end) {
-            if (cur->pClass) {
-                source = cur;
-                break;
-            }
-            ++cur;
-        }
-    }
-
-    if (source) {
-        moby->pClass = source->pClass;
-        KOTH_LOG("\nhill_attach_class: adopted class=%08x from moby=%08x", moby->pClass, source);
-    } else {
-        KOTH_LOG("\nhill_attach_class: no source class found");
-    }
-}
-
 static int clampIndex(int idx, int max)
 {
     if (max <= 0)
@@ -834,6 +802,7 @@ void kothReset(void)
     cachedIsCircle = -1;
     mapHillMoby = NULL;
     kothReady = 0;
+    hillClassCache = NULL;
     lastTimeStart = -1;
     lastSeed = -1;
     kothUpdateHillScale(kothConfig.hillScale);
@@ -848,6 +817,7 @@ void kothShutdown(void)
     }
     mapHillMoby = NULL;
     kothReady = 0;
+    hillClassCache = NULL;
 }
 
 void kothSetConfig(PatchGameConfig_t* config)
