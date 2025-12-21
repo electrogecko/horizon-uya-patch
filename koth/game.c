@@ -101,10 +101,15 @@ static PatchGameConfig_t kothConfigCache;
 static int hasConfigCache = 0;
 static int hillCycleStartTime = -1;
 static int hillDurationLogged = 0;
+static int hillOrder[32];
+static int hillOrderCount = 0;
+static int hillOrderCursor = 0;
+static int hillOrderInitialized = 0;
 
 // Forward declarations for helpers used before definition.
 static int hillEnumerateSpawnCuboids(hillPvar_t* pvars);
 static int cuboidEquals(const Cuboid* a, const Cuboid* b);
+static void shuffleHillOrder(u32 seed, int count);
 
 static void hillAdvanceCuboidCursor(hillPvar_t* pvars)
 {
@@ -174,6 +179,29 @@ static void kothUpdateHillScale(float scale)
 }
 
 static int clampIndex(int idx, int max);
+static void shuffleHillOrder(u32 seed, int count)
+{
+    if (count <= 0)
+        return;
+    int i;
+    for (i = 0; i < count && i < (int)COUNT_OF(hillOrder); ++i)
+        hillOrder[i] = i;
+    int useCount = count;
+    if (useCount > (int)COUNT_OF(hillOrder))
+        useCount = (int)COUNT_OF(hillOrder);
+    if (!seed)
+        seed = 1;
+    for (i = useCount - 1; i > 0; --i) {
+        seed = seed * 1664525u + 1013904223u;
+        int j = seed % (i + 1);
+        int tmp = hillOrder[i];
+        hillOrder[i] = hillOrder[j];
+        hillOrder[j] = tmp;
+    }
+    hillOrderCount = useCount;
+    hillOrderCursor = 0;
+    hillOrderInitialized = 1;
+}
 
 static int hillEnumerateSpawnCuboids(hillPvar_t* pvars)
 {
@@ -252,6 +280,12 @@ static int hillTryUseMobyCuboid(hillPvar_t* pvars, Moby* moby, const char** outL
     if (count > 0) {
         if (!pvars->foundMoby)
             pvars->cuboidCursor = 0;
+        if (!hillOrderInitialized) {
+            int shuffleCount = count;
+            if (shuffleCount > (int)COUNT_OF(hillOrder))
+                shuffleCount = (int)COUNT_OF(hillOrder);
+            shuffleHillOrder(currentSeed ? (u32)currentSeed : 1, shuffleCount);
+        }
         pvars->foundMoby = 1; // cache that we already parsed a valid cuboid list
 		/*
         // Log discovered cuboids once on initial parse.
@@ -710,6 +744,11 @@ static void hillRefreshActiveCuboid(Moby* moby)
 
     if (!chosen && pvars->foundMoby && pvars->cuboidCount > 0) {
         int idx = clampIndex(pvars->cuboidCursor, pvars->cuboidCount);
+        if (hillOrderInitialized && hillOrderCount > 0) {
+            int orderIdx = hillOrder[idx % hillOrderCount];
+            if (orderIdx >= 0 && orderIdx < pvars->cuboidCount)
+                idx = orderIdx;
+        }
         chosen = spawnPointGet(pvars->cuboidIndex[idx]);
         chosenLabel = "hill-list";
     }
@@ -755,13 +794,13 @@ static void hillRefreshActiveCuboid(Moby* moby)
         lastDrawCuboid = *pvars->currentCuboid;
         cachedSegments = -1;
         cachedIsCircle = -1;
-        printf("\nhillRefreshActiveCuboid: v0[0]=%d v1[1]=%d v2[2]=%d pos=%d,%d,%d",
+        /*printf("\nhillRefreshActiveCuboid: v0[0]=%d v1[1]=%d v2[2]=%d pos=%d,%d,%d",
             (int)pvars->currentCuboid->matrix.v0[0],
             (int)pvars->currentCuboid->matrix.v1[1],
             (int)pvars->currentCuboid->matrix.v2[2],
             (int)pvars->currentCuboid->pos[0],
             (int)pvars->currentCuboid->pos[1],
-            (int)pvars->currentCuboid->pos[2]);
+            (int)pvars->currentCuboid->pos[2]);*/
     }
 
     if (now - lastLogTime >= TIME_SECOND) {
@@ -901,7 +940,7 @@ static int clampIndex(int idx, int max)
 
 void kothReset(void)
 {
-    printf("\nkothReset: was called !!!!!") ;
+    //printf("\nkothReset: was called !!!!!") ;
     memset(&kothInfo, 0, sizeof(kothInfo));
     spawned = 0;
     scrollQuad = 0;
@@ -914,6 +953,9 @@ void kothReset(void)
     lastSeed = -1;
     hillCycleStartTime = -1;
     hillDurationLogged = 0;
+    hillOrderCount = 0;
+    hillOrderCursor = 0;
+    hillOrderInitialized = 0;
     kothUpdateHillScale(kothConfig.hillScale);
     KOTH_LOG("\nkothReset: state cleared");
 }
@@ -950,7 +992,7 @@ void kothSetConfig(PatchGameConfig_t* config)
 
     kothUpdateHillScale(kothConfig.hillScale);
     //KOTH_LOG("\nkothSetConfig: score=%d durationMs=%d scaleIdx=%d", kothConfig.scoreLimit, kothConfig.hillDurationMs, sizeIdx);
-    printf("\nkothSetConfig: score=%d durationMs=%d scaleIdx=%d", kothConfig.scoreLimit, kothConfig.hillDurationMs, sizeIdx);
+    //printf("\nkothSetConfig: score=%d durationMs=%d scaleIdx=%d", kothConfig.scoreLimit, kothConfig.hillDurationMs, sizeIdx);
 	
     if (kothInfo.kothMoby && kothInfo.kothMoby->pVar) {
         hillPvar_t* pvars = (hillPvar_t*)kothInfo.kothMoby->pVar;
@@ -1005,7 +1047,7 @@ void kothTick(void)
         if (durationHit && !hillDurationLogged) {
             hillDurationLogged = 1;
             //KOTH_LOG("\nkothTick: hill duration elapsed (elapsed=%d duration=%d) hostRotate=%d", elapsed, duration, hostShouldRotate);
-			printf("\nkothTick: hill duration elapsed (elapsed=%d duration=%d) hostRotate=%d", elapsed, duration, hostShouldRotate);
+			//printf("\nkothTick: hill duration elapsed (elapsed=%d duration=%d) hostRotate=%d", elapsed, duration, hostShouldRotate);
         }
         if (durationHit) {
             hillCycleStartTime = now;
