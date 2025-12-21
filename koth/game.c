@@ -102,6 +102,10 @@ static int hasConfigCache = 0;
 static int hillCycleStartTime = -1;
 static int hillDurationLogged = 0;
 
+// Forward declarations for helpers used before definition.
+static int hillEnumerateSpawnCuboids(hillPvar_t* pvars);
+static int cuboidEquals(const Cuboid* a, const Cuboid* b);
+
 static void hillAdvanceCuboidCursor(hillPvar_t* pvars)
 {
     if (!pvars)
@@ -125,7 +129,7 @@ static const Cuboid HILL_CUBOID_TEMPLATE = {
         {0, 0, 1, 0}
     },
     .pos = {519.58356, 398.7586, 201.38, 1},
-    .imatrix = 0,
+    .imatrix = {0},
     .rot = {0, 0, 0, 0}
 };
 
@@ -136,11 +140,27 @@ static Cuboid rawr = {
         {0, 0, 1, 0}
     },
     .pos = {519.58356, 398.7586, 201.38, 1},
-    .imatrix = 0,
+    .imatrix = {0},
     .rot = {0, 0, 0, 0}
 };
 
 static Moby* getHillMoby(void);
+// NOTE DO NOT REUSE THIS FUNCTION AS ITS MARKED FOR DELETION 
+static int cuboidEquals(const Cuboid* a, const Cuboid* b)
+{
+    if (!a || !b)
+        return 0;
+
+    const u32* pa = (const u32*)a;
+    const u32* pb = (const u32*)b;
+    int words = sizeof(Cuboid) / sizeof(u32);
+    int i;
+    for (i = 0; i < words; ++i) {
+        if (pa[i] != pb[i])
+            return 0;
+    }
+    return 1;
+}
 
 
 
@@ -233,6 +253,28 @@ static int hillTryUseMobyCuboid(hillPvar_t* pvars, Moby* moby, const char** outL
         if (!pvars->foundMoby)
             pvars->cuboidCursor = 0;
         pvars->foundMoby = 1; // cache that we already parsed a valid cuboid list
+		/*
+        // Log discovered cuboids once on initial parse.
+        static int loggedCuboids = 0;
+        if (!loggedCuboids) {
+            int j;
+            for (j = 0; j < count; ++j) {
+                int cidx = pvars->cuboidIndex[j];
+                Cuboid* c = spawnPointGet(cidx);
+                if (!c)
+                    continue;
+                printf("\nhillTryUseMobyCuboid: idx=%d v0[0]=%d v1[1]=%d v2[2]=%d pos=%d,%d,%d",
+                    cidx,
+                    (int)c->matrix.v0[0],
+                    (int)c->matrix.v1[1],
+                    (int)c->matrix.v2[2],
+                    (int)c->pos[0],
+                    (int)c->pos[1],
+                    (int)c->pos[2]);
+            }
+            loggedCuboids = 1;
+        }
+		*/
     }
     if (count > 0 && pickedIdx >= 0) {
         Cuboid* src = spawnPointGet(pickedIdx);
@@ -356,7 +398,7 @@ void circleMeFinal_StripMe(Moby* this, Cuboid cube)
     hillPvar_t* pvar = (hillPvar_t*)this->pVar;
     int isCircle = pvar->isCircle;
     u32 baseColor = pvar->color;
-    int i, edge, s;
+    int i, edge;
 
     /* Setup rotation matrix from cube */
     MATRIX rotMatrix;
@@ -421,7 +463,7 @@ void circleMeFinal_StripMe(Moby* this, Cuboid cube)
     /* === Setup shape-specific parameters === */
     VECTOR corners[4], vRadius;
     int segmentsPerEdge[4];
-    float thetaStep;
+    float thetaStep = 0;
 
     if (isCircle) {
         thetaStep = (2.0f * MATH_PI) / segments;
@@ -638,6 +680,8 @@ static void hill_drawShape(Moby* moby, Cuboid cube)
 static void hillRefreshActiveCuboid(Moby* moby)
 {
     static int lastLogTime = -TIME_SECOND;
+    static Cuboid lastDrawCuboid;
+    static int haveLastDrawCuboid = 0;
 
     hillPvar_t* pvars = (hillPvar_t*)moby->pVar;
     if (!pvars)
@@ -702,22 +746,33 @@ static void hillRefreshActiveCuboid(Moby* moby)
         chosenLabel = "rawr-safety";
     }
 
-    // Force strip geometry rebuild when the cuboid changes (position/shape), but avoid the very first few frames.
     int now = gameGetTime();
-    if (now >= 10 * TIME_SECOND) {
-		//printf("\n TIMER EXPIRED TIMERR EXPIRED SDJHFKJSDHFKJ"); 
-		int fasdf = 0; 
+
+    // Force strip geometry rebuild when the cuboid changes (position/shape/rotation/position).
+	//TODO disable this if things look good without it. (which can delete cuboidEquals function) 
+    if (!haveLastDrawCuboid || !cuboidEquals(&lastDrawCuboid, pvars->currentCuboid)) {
+        haveLastDrawCuboid = 1;
+        lastDrawCuboid = *pvars->currentCuboid;
         cachedSegments = -1;
-       cachedIsCircle = -1;
+        cachedIsCircle = -1;
+        printf("\nhillRefreshActiveCuboid: v0[0]=%d v1[1]=%d v2[2]=%d pos=%d,%d,%d",
+            (int)pvars->currentCuboid->matrix.v0[0],
+            (int)pvars->currentCuboid->matrix.v1[1],
+            (int)pvars->currentCuboid->matrix.v2[2],
+            (int)pvars->currentCuboid->pos[0],
+            (int)pvars->currentCuboid->pos[1],
+            (int)pvars->currentCuboid->pos[2]);
     }
-    
+
     if (now - lastLogTime >= TIME_SECOND) {
         lastLogTime = now;
+#ifdef KOTH_LOG
         int posX = (int)pvars->currentCuboid->pos[0];
         int posY = (int)pvars->currentCuboid->pos[1];
         int posZ = (int)pvars->currentCuboid->pos[2];
         KOTH_LOG("\nhillRefreshActiveCuboid: pvars=%p cuboid=%p pos=%d,%d,%d cursor=%d count=%d",
                  pvars, pvars->currentCuboid, posX, posY, posZ, pvars->cuboidCursor, pvars->cuboidCount);
+#endif
     }
 }
 
@@ -734,10 +789,12 @@ void hill_postDraw(Moby* moby)
     int now = gameGetTime();
     if (now - lastRenderLogTime >= TIME_SECOND) {
         lastRenderLogTime = now;
+#ifdef KOTH_LOG
         int px = (int)pvars->currentCuboid->pos[0];
         int py = (int)pvars->currentCuboid->pos[1];
         int pz = (int)pvars->currentCuboid->pos[2];
         KOTH_LOG("\nhill_postDraw: pvars=%p cuboid=%p pos=%d,%d,%d circle=%d", pvars, pvars->currentCuboid, px, py, pz, pvars->isCircle);
+#endif
     }
 
     if (vector_length(pvars->currentCuboid->matrix.v2) > 1.0001)
