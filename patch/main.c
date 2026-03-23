@@ -479,6 +479,10 @@ void runCameraSpeedPatch(void)
  */
 int patchKillStealing_Hook(Player * target, Moby * damageSource, u64 a2)
 {
+	// Bots or pseudo-players may not have a full net-player backing state.
+	if (!target || !target->pNetPlayer || !target->pNetPlayer->pNetPlayerData)
+		return 0;
+
 	// if player is already dead return 0
 	if (target->pNetPlayer->pNetPlayerData->hitPoints <= 0)
 		return 0;

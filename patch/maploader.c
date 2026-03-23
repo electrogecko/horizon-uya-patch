@@ -27,6 +27,8 @@
 #define HOST_PATH_PREFIX      "host:"
 
 #define MAP_FRAG_PAYLOAD_MAX_SIZE               (1024)
+#define USB_FS_MODULE_BUFFER_SIZE               (41216)
+#define USB_SRV_MODULE_BUFFER_SIZE              (12288)
 #define LOAD_MODULES_STATE                      (*(u8*)0x000cfff0)
 #define LOAD_MODULES_RESULT                     (*(u8*)0x000cfff1)
 #define HAS_LOADED_MODULES                      (LOAD_MODULES_STATE == 100)
@@ -295,10 +297,13 @@ int onSetMapOverride(void * connection, void * data)
 		// send response
 		msg.Version = version;
 		strncpy(msg.Filename, payload->CustomMap.Filename, sizeof(msg.Filename));
+		msg.Filename[sizeof(msg.Filename) - 1] = 0;  // strncpy() does not guarantee null termination src str >= dst buffer
 		netSendCustomAppMessage(connection, NET_LOBBY_CLIENT_INDEX, CUSTOM_MSG_ID_SET_MAP_OVERRIDE_RESPONSE, sizeof(msg), &msg);
 
 		strncpy(MapLoaderState.MapName, payload->CustomMap.Name, sizeof(MapLoaderState.MapName));
 		strncpy(MapLoaderState.MapFileName, payload->CustomMap.Filename, sizeof(MapLoaderState.MapFileName));
+		MapLoaderState.MapName[sizeof(MapLoaderState.MapName) - 1] = 0;
+		MapLoaderState.MapFileName[sizeof(MapLoaderState.MapFileName) - 1] = 0;
 		
 		// enable
 		if (version >= 0) {
@@ -333,6 +338,10 @@ int onServerSentMapIrxModules(void * connection, void * data)
 	// 
 	usbFsModuleSize = msg->Module1Size;
 	usbSrvModuleSize = msg->Module2Size;
+	if (usbFsModuleSize <= 0 || usbFsModuleSize > USB_FS_MODULE_BUFFER_SIZE || usbSrvModuleSize <= 0 || usbSrvModuleSize > USB_SRV_MODULE_BUFFER_SIZE) {
+		actionState = ACTION_ERROR_LOADING_MODULES; // Reject missing, zero-len, or neg module sizes 
+		return sizeof(MapServerSentModulesMessage);
+	}
 
 	// 
 	loadModules();
@@ -696,6 +705,7 @@ void refreshCustomMapList(void)
 		// PS2s use iomanX but the emu HLE hostfs thinks we're using ioman
 		if (useHost) strncpy(filename, iomanDirent->name, sizeof(filename));
 		else strncpy(filename, dirent.name, sizeof(filename));
+		filename[sizeof(filename) - 1] = 0;
 
 		// OSX creates index files starting with a '.'
 		// filter those out
@@ -704,6 +714,7 @@ void refreshCustomMapList(void)
 		// we want to parse the .version files
 		// check if filename ends with ".version"
 		int len = strlen(filename);
+		if (len < versionExtLen) continue;
 		if (strncmp(&filename[len-versionExtLen], versionExt, versionExtLen) != 0) continue;
 
 		#if DSCRPRINT
@@ -726,7 +737,9 @@ void refreshCustomMapList(void)
 		
 		// compute filename without extension
 		strncpy(filenameWithoutExtension, filename, sizeof(filenameWithoutExtension));
+		filenameWithoutExtension[sizeof(filenameWithoutExtension) - 1] = 0;
 		len = strlen(filenameWithoutExtension);
+		if (len < versionExtLen) continue;
 		filenameWithoutExtension[len - versionExtLen] = 0;
 
 		// ensure version file has matching .world OR .wad
@@ -825,14 +838,18 @@ int searchUSBForSpecificMap(const char* mapFilename, CustomMapDef_t* outMapDef)
 		char filename[256];
 		if (useHost) strncpy(filename, iomanDirent->name, sizeof(filename));
 		else strncpy(filename, dirent.name, sizeof(filename));
+		filename[sizeof(filename) - 1] = 0;
 
 		int len = strlen(filename);
+		if (len < versionExtLen) continue;
 		if (strncmp(&filename[len-versionExtLen], versionExt, versionExtLen) != 0) continue;
 
 		// Extract filename without extension
 		char filenameWithoutExtension[64];
 		strncpy(filenameWithoutExtension, filename, sizeof(filenameWithoutExtension));
+		filenameWithoutExtension[sizeof(filenameWithoutExtension) - 1] = 0;
 		int nameLen = strlen(filenameWithoutExtension);
+		if (nameLen < versionExtLen) continue;
 		filenameWithoutExtension[nameLen - versionExtLen] = 0;
 
 		// Check if this matches the map we're looking for
@@ -1299,16 +1316,16 @@ int align(int addr, int align)
 int mapsAllocateModuleBuffer(void)
 {
 	if (!USB_FS_MODULE_PTR) {
-		USB_FS_MODULE_PTR = malloc(41216);
+		USB_FS_MODULE_PTR = malloc(USB_FS_MODULE_BUFFER_SIZE + 0x10); // 0x10 for alignment 
 		if (USB_FS_MODULE_PTR) {
-			memset(USB_FS_MODULE_PTR, 0, 41216);
+			memset(USB_FS_MODULE_PTR, 0, USB_FS_MODULE_BUFFER_SIZE + 0x10);
 			USB_FS_MODULE_PTR = (void*)align((int)USB_FS_MODULE_PTR, 0x10);
 		}
 	}
 	if (!USB_SRV_MODULE_PTR) {
-		USB_SRV_MODULE_PTR = malloc(12288);
+		USB_SRV_MODULE_PTR = malloc(USB_SRV_MODULE_BUFFER_SIZE + 0x10);
 		if (USB_SRV_MODULE_PTR) {
-			memset(USB_SRV_MODULE_PTR, 0, 12288);
+			memset(USB_SRV_MODULE_PTR, 0, USB_SRV_MODULE_BUFFER_SIZE + 0x10);
 			USB_SRV_MODULE_PTR = (void*)align((int)USB_SRV_MODULE_PTR, 0x10);
 		}
 	}
