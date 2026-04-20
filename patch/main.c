@@ -1369,8 +1369,8 @@ void customFlagLogic(Moby* flagMoby)
 		return;
 	}
 
-    if ((pvars->TimeFlagDropped + (TIME_SECOND * 1.5)) > gameTime)
-        return;
+	if ((pvars->TimeFlagDropped + (TIME_SECOND * 0.5)) > gameTime)
+		return;
 
     for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
         Player* player = players[i];
@@ -1407,6 +1407,9 @@ void customFlagLogic(Moby* flagMoby)
 		// player is on different team than flag and player isn't already holding flag
 		if (player->mpTeam != pvars->Team) {
 			if (!player->flagMoby) {
+				if (player->mpIndex != pvars->LastCarrierIdx && (pvars->TimeFlagDropped + (TIME_SECOND * 1.5)) > gameTime)
+					continue;
+
 				flagRequestPickup(flagMoby, player->mpIndex);
 				return;
 			}
