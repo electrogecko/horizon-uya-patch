@@ -7,7 +7,8 @@ all:
 	$(MAKE) -C midflag
 	$(MAKE) -C domination
 	$(MAKE) -C koth
-	
+	$(MAKE) -C juggernaut
+
 clean:
 	$(MAKE) -C libuya clean
 	$(MAKE) -C patch clean
@@ -18,6 +19,7 @@ clean:
 	$(MAKE) -C midflag clean
 	$(MAKE) -C domination clean
 	$(MAKE) -C koth clean
+	$(MAKE) -C juggernaut clean
 
 install:
 	$(MAKE) -C libuya install
