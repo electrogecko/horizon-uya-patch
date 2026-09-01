@@ -683,6 +683,65 @@ void hjDumpPeers(void)
     //   16fa84  jal 0x171d18      ; publish it
     // p438 is therefore the prime suspect for the whole hot-join stall. Print it, plus
     // p400 (my own record pointer) and its 0x08, so we can see the sender's actual input.
+    // ---- FIX (experiment): finish the announce step the joiner skipped ----
+    // 0x16f7d8 (connect) contains:
+    //   16fa68  bnez v0,0x16fac0   ; if (s6 | peers->0x438) != 0 -> SKIP
+    //   16fa70  li v0,5
+    //   16fa78  sw v0,8(s0)        ; myRecord->0x08 = 5
+    //   16fa80  sw s2,24(s0)       ; myRecord->0x18 = 1
+    // Runtime shows peers->0x438 == 1 while connect runs, and it only clears to 0 once
+    // the HOST's type-5 message arrives -- after connect has already passed the check.
+    // Nothing re-runs that block, so myRecord->0x08 stays 4 forever. Since the sender
+    // (0x14bdb0) uses myRecord->0x08 as the outbound message type, the joiner can never
+    // emit type 5 and the host never completes.
+    //
+    // Perform the skipped assignment once, only when the preconditions the original
+    // block would have seen are now true: our record is at 4 (introduce done) and 0x438
+    // has cleared. Deliberately NOT calling 0x171d18 as well: that would overwrite
+    // peers->0x408, which on the joiner legitimately points at the host, and the goal
+    // here is only to make the joiner announce itself.
+    {
+        u32 mine0 = *(u32*)(peers + 0x400);
+        if (mine0 && *(u32*)(peers + 0x438) == 0 && *(int*)(mine0 + 0x08) == 4) {
+            *(int*)(mine0 + 0x08) = 5;
+            *(int*)(mine0 + 0x18) = 1;
+            // Setting the field alone is not enough: the 3 and 4 the host receives are
+            // emitted during the connect handshake, and by the time 0x438 clears nothing
+            // sends again -- the host kept seeing only 3 and 4 with our record already at
+            // 5. So drive the send ourselves. 0x14bdb0(peers, targetIdx) is the peer
+            // message sender (RT type 22); it reads the type from myRecord->0x08, which we
+            // have just set to 5. targetIdx -1 = broadcast to every established peer.
+            hjAnnounceSends = 0;
+            if (!hjAnnounceDone) {
+                hjAnnounceDone = 1;
+                HOTJOIN_LOG("announce: myRecord %08x 0x08 -> 5, 0x18 -> 1 (p438=0), sending\n",
+                    mine0);
+            }
+        }
+    }
+
+    // REVERTED: driving the send ourselves via 0x14bdb0(peers, -1) regressed the
+    // handshake -- with it in, myRecord->0x08 stopped advancing past 3 (it previously
+    // reached 4, then 5 via the announce fix) and joins failed or hung. One attempt is
+    // thin evidence, but an unproven write into the send path is not worth carrying while
+    // the rest works, so it is out. If revisited: find why calling the sender outside its
+    // normal sequence disturbs the handshake, rather than re-adding it blind.
+
+    // Setting myRecord->0x08 is not sufficient on its own: the 3 and 4 the host receives
+    // are emitted during the connect handshake, and once 0x438 clears nothing sends again
+    // -- the host kept seeing only 3 and 4 while our record already read 5. So drive the
+    // send. 0x14bdb0(peers, targetIdx) is the peer message sender (RT type 22); it takes
+    // the outbound type from myRecord->0x08, which the block above has set to 5.
+    // targetIdx -1 = broadcast to every established peer. Repeat a few times: these are
+    // UDP datagrams and this protocol demonstrably depends on retransmission.
+    {
+        u32 mine1 = *(u32*)(peers + 0x400);
+        if (mine1 && *(int*)(mine1 + 0x08) == 5 && hjAnnounceSends < 8) {
+            ++hjAnnounceSends;
+            internal_hjSendPeerMsg((void*)peers, -1);
+        }
+    }
+
     {
         u32 mine = *(u32*)(peers + 0x400);
         HOTJOIN_LOG("peers: me=%d n=%d gate=%d p408=%d p438=%08x mine=%08x mine08=%d ---\n",
