@@ -185,6 +185,8 @@ extern mapOverrideResponse;
 
 extern int internal_hjResolvePlayerCtx(void ** out, void * arg);
 extern void internal_hjPeerConnectCtor(void * a0, void * a1);
+extern void * internal_hjPeerLookup(void * peers, int idx);
+extern int internal_hjIntroducePeer(void * ctx, int peerIdx, int a2, int a3);
 
 static int hjPlayerBitInstalled = 0;
 static int hjPlayerBitSkips = 0;
@@ -484,6 +486,408 @@ void hjInstallAuxAcceptProbe(void)
     HOTJOIN_LOG("auxaccept: maxTypes=%d, hooked %d stack(s)\n", (int)maxTypes, hooked);
 }
 
+// ---------------------------------------------------------------------------
+// Hotjoin: the joiner's Player has no PAD, which is the single root cause of
+// every in-game TLB fault we have seen (Metropolis addresses shown; the same
+// faults appear at different VAs on other maps because this is per-map code):
+//
+//   0x4ffb38  lw $2,9524($16)   ; player->pPad          (0x2534 = PAD *pPad)
+//   0x4ffb4c  lw $2,452($2)     ; pPad->0x1c4   <-- TLB, pPad == NULL
+//   0x525008  lw $3,416($4)     ; pPad->0x1a0   <-- TLB
+//   0x487c48  lw $2,1384($4)    ; pad->0x568    <-- TLB, pad passed as a0
+//
+// It originates in player construction:
+//   0x525c80  lw $4,0($5)       ; $5 = padTable + playerIndex*4
+//   0x525c84  sw $4,9524($18)   ; player->pPad = padTable[playerIndex]
+//   0x525c98  jal 0x487c48      ; immediately used -> faults when NULL
+// so the table entry for the joiner's slot is empty; the pads are set up during
+// the normal game-start sequence, which a hot-joiner skips.
+//
+// The engine itself treats a NULL pad as recoverable: the sibling routine at
+// 0x487c70 does `bnez $4 ...` and substitutes the global at 0x225900. We do the
+// same thing one level earlier -- fill in a missing pPad rather than let every
+// consumer fault -- and log what we found, because we still do not know WHICH
+// players are missing pads (local vs remote) and that determines the real fix.
+// ---------------------------------------------------------------------------
+#define HJ_PAD_TABLE        (0x002412F0)   // candidate only -- see note below
+#define HJ_PAD_P1           (0x00225900)   // REAL local pad, confirmed at runtime
+// The `P1_PAD = 0x225980` label in known_labels_ntsc.tsv is 0x80 past the actual pad.
+// Host runtime proves it: its padtable[0] AND its local player's pPad both read
+// 0x00225900, and the engine's own NULL-substitute at 0x487c70 uses 0x225900 too.
+// Filling the joiner's pPad with 0x225980 pointed every field access 0x80 into the
+// struct -- scrambled input, which is the likeliest cause of the "jumbled, hard to
+// move" behaviour (a NULL pad instead gives no input at all, which is what session 7
+// showed).
+#define HJ_PAD_STRIDE       (0x1700)
+#define HJ_PAD_SLOTS        (8)
+#define HJ_PLAYER_PPAD_OFF  (0x2534)
+#define HJ_PLAYER_MPIDX_OFF (0x2544)
+
+// 0x2412F0 was derived statically from the constructor (525c4c addiu $2,$2,4848) but a
+// runtime dump proved it wrong -- slots 4..7 hold floats (3f800000 = 1.0f, 3c888889 =
+// 1/60), so this is not a pointer array. The guarded write never fired, which is the
+// only reason nothing got corrupted. Keep dumping it for reference; never write to it
+// until a run shows entries that actually look like pads.
+static int hjPadTableLogged = 0;
+static int hjPadFillLogged = 0;
+static int hjPlayerMapLogged = 0;
+
+static int hjLooksLikePad(u32 v)
+{
+    // Was anchored on 0x225980 and therefore rejected the real pad 0x225900, which is
+    // why even the HOST -- which has a perfectly good padtable[0] -- reported valid=0.
+    // The table was never the problem; the validator was.
+    if (v < HJ_PAD_P1) return 0;
+    if (v >= HJ_PAD_P1 + (4 * HJ_PAD_STRIDE)) return 0;
+    return ((v - HJ_PAD_P1) % HJ_PAD_STRIDE) == 0;
+}
+
+void hjFixMissingPads(void)
+{
+    u32 * table = (u32*)HJ_PAD_TABLE;
+    int i, valid = 0, spare = 1;
+
+    if (isInMenus())
+        return;
+
+    for (i = 0; i < HJ_PAD_SLOTS; ++i)
+        if (hjLooksLikePad(table[i]))
+            ++valid;
+
+    if (hjPadTableLogged < 3) {
+        ++hjPadTableLogged;
+        HOTJOIN_LOG("padtable @%08x: %08x %08x %08x %08x %08x %08x %08x %08x (valid=%d)\n",
+            (u32)table, table[0], table[1], table[2], table[3],
+            table[4], table[5], table[6], table[7], valid);
+    }
+
+    // Repair ONLY the local player (slot 0), and only when its pad is NULL.
+    //
+    // A previous version filled every NULL pPad, cycling P1..P4 with `spare & 3`. That
+    // handed P1 to slot 0 AND slot 6, and P2 to slot 1 AND slot 7. Those pad structs are
+    // written every frame (the 0x568/0x56c/0x570 stores), so two players were clobbering
+    // one input buffer -- which is what produced movement that was "jumbled and hard,
+    // button-mashing does some stuff". It also handed a pad to slot 4, which the runtime
+    // dump shows is uninitialised (mpIndex=-842150451, pPad=0xcdcdcdcd, i.e. 0xcd fill).
+    //
+    // Observed layout: players are 0x4500 apart from 0x2f77c0; slot 0 is this console's
+    // local player and carries mpIndex=1 (the hot-joiner is player index 1); slot 5
+    // already holds a valid pad (0x311820) that we must not touch.
+    //
+    // Remote players keep a NULL pPad for now. That re-admits their per-frame TLB misses,
+    // which are noisy but non-fatal -- and correct input for the local player is worth
+    // more than a quiet log until we know where per-player pads are really allocated.
+    {
+        Player * p = playerGetFromSlot(0);
+        if (p) {
+            u32 * ppad = (u32*)((u32)p + HJ_PLAYER_PPAD_OFF);
+            int mpIndex = *(int*)((u32)p + HJ_PLAYER_MPIDX_OFF);
+
+            if (hjPlayerMapLogged < 8) {
+                int j;
+                for (j = 0; j < GAME_MAX_PLAYERS; ++j) {
+                    Player * q = playerGetFromSlot(j);
+                    if (!q) continue;
+                    ++hjPlayerMapLogged;
+                    HOTJOIN_LOG("playermap: slot=%d player=%08x mpIndex=%d pPad=%08x\n",
+                        j, (u32)q, *(int*)((u32)q + HJ_PLAYER_MPIDX_OFF),
+                        *(u32*)((u32)q + HJ_PLAYER_PPAD_OFF));
+                }
+                hjPlayerMapLogged = 8;
+            }
+
+            if (!*ppad) {
+                *ppad = HJ_PAD_P1;
+                if (hjPadFillLogged < 4) {
+                    ++hjPadFillLogged;
+                    HOTJOIN_LOG("padfill: LOCAL slot=0 mpIndex=%d pPad NULL -> %08x\n",
+                        mpIndex, *ppad);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hotjoin: why does the host<->joiner peer link never complete?
+//
+// Both ends retransmit forever -- host logs `peerconnreq idx=1`, joiner logs
+// `peerconnreq idx=0`, every ~3 s, indefinitely. A peer is marked CONNECTED by
+//   172970:  sw $2,8($3)      ; peer->0x08 = 5
+// inside 0x172898, which its caller at 0x172668 only reaches when the peer index
+// equals ctx->0x408. Rather than keep deducing the state machine statically (that
+// approach has produced two wrong answers today), just print the peer table.
+//
+// peer = 0x14f8e8(ctx->0xE8, idx); fields seen in use:
+//   0x08 = state (2 = connecting, 3 = ?, 5 = CONNECTED)
+//   0x18 = sequence assigned by 0x173fc0
+//   0x1C = "eligible to receive a connect request" (checked by the retransmit loop)
+// ---------------------------------------------------------------------------
+static int hjPeerDumps = 0;
+static int hjAnnounceDone = 0;
+static int hjAnnounceSends = 8;   // resend a few times; a single datagram can be lost
+static u32 hjLastPeerSig = 0;
+
+void hjDumpPeers(void)
+{
+    u32 ctx = *(u32*)HJ_NET_CTX_PTR;
+    u32 peers, sig = 0;
+    int i;
+
+    if (!ctx)
+        return;
+    peers = *(u32*)(ctx + HJ_CTX_PEERS);
+    if (!peers)
+        return;
+
+    // Only print when something actually changes, so this stays readable across a
+    // multi-minute session instead of flooding at 60 Hz.
+    for (i = 0; i < 8; ++i) {
+        void * p = internal_hjPeerLookup((void*)peers, i);
+        sig = (sig * 31) + (p ? (*(u32*)((u32)p + 0x08) + 1) : 0);
+    }
+    // Cap per game-entry, not per boot. The first version used a single global cap of
+    // 40, which was entirely consumed by ~17 failed connect attempts in the menu -- so
+    // the log went silent exactly when the joiner finally got in-game, which is the only
+    // moment that matters. Reset the budget on each menus->in-game transition.
+    if (isInMenus()) {
+        hjPeerDumps = 0;
+        hjLastPeerSig = 0;
+    }
+    if (sig == hjLastPeerSig || hjPeerDumps > 60)
+        return;
+    hjLastPeerSig = sig;
+    ++hjPeerDumps;
+
+    // 0x404 (my index), 0x430 (sweep gate) and 0x43C (peer count) are fields of the
+    // PEERS block (ctx->0xE8), not of ctx -- the sweep reads them as 1028(s1)/1072(s1)/
+    // 1084(s1) with s1 = ctx->0xE8. An earlier version read them off ctx and printed
+    // "me=0 n=0" every time; that was garbage, not a finding.
+    // p408 is the field the mark-connected guard compares a peer index against
+    // (0x172658: `bne s4,v1` where v1 = peers->0x408). It is initialised to 256 at
+    // 0x14f474 and is only ever set by RECEIVING peer message type 5, whose handler
+    // branch calls ctx->0x44 = 0x171d18 -> `sw a1,1032(a0)`. A host that never receives
+    // type 5 keeps 408 == 256, which matches no peer index, so it can never mark the
+    // joiner connected -- and then wipes the half-open record.
+    // The outbound peer message type is NOT built from a constant -- the sender at
+    // 0x14bdb0 reads it straight out of its own record:
+    //   14bde4  lw  s0,1024(s2)   ; s0 = peers->0x400 (my own record)
+    //   14be08  lbu v1,8(s0)      ; myRecord->0x08
+    //   14be0c  sb  v1,0(sp)      ; payload[0] = that
+    // So the joiner sends 3 then 4 because its own 0x08 is 3 then 4, and it never sends
+    // 5 because its own 0x08 never becomes 5. The step that would set it is in the
+    // connect path:
+    //   16fa68  bnez v0,0x16fac0  ; if (s6 | peers->0x438) != 0 -> SKIP
+    //   16fa70  li v0,5
+    //   16fa78  sw v0,8(s0)       ; myRecord->0x08 = 5
+    //   16fa84  jal 0x171d18      ; publish it
+    // p438 is therefore the prime suspect for the whole hot-join stall. Print it, plus
+    // p400 (my own record pointer) and its 0x08, so we can see the sender's actual input.
+    {
+        u32 mine = *(u32*)(peers + 0x400);
+        HOTJOIN_LOG("peers: me=%d n=%d gate=%d p408=%d p438=%08x mine=%08x mine08=%d ---\n",
+            *(int*)(peers + 0x404), *(int*)(peers + 0x43C),
+            *(int*)(peers + 0x430), *(int*)(peers + 0x408),
+            *(u32*)(peers + 0x438), mine, mine ? *(int*)(mine + 0x08) : -1);
+    }
+    for (i = 0; i < 8; ++i) {
+        void * p = internal_hjPeerLookup((void*)peers, i);
+        if (!p)
+            continue;
+        // +0x08 is NOT reliably a connection state: the type-22 handler at 0x150dd8
+        // looks the peer up (0x150e10) and then does `sw a1,8(s2)` at 0x150e48, writing
+        // the INCOMING MESSAGE TYPE into it. So the 3->4->0 sequence we chased may be
+        // message types arriving, not a teardown. Dump the neighbouring fields so a real
+        // state machine can be told apart from that echo.
+        HOTJOIN_LOG("peers: [%d] %08x t08=%d f00=%08x f04=%08x f0C=%08x f10=%08x\n",
+            i, (u32)p, *(int*)((u32)p + 0x08), *(u32*)((u32)p + 0x00),
+            *(u32*)((u32)p + 0x04), *(u32*)((u32)p + 0x0C), *(u32*)((u32)p + 0x10));
+        HOTJOIN_LOG("peers: [%d]          f14=%08x f18=%d f1C=%d f20=%08x f24=%08x f28=%08x\n",
+            i, *(u32*)((u32)p + 0x14), *(int*)((u32)p + 0x18), *(int*)((u32)p + 0x1C),
+            *(u32*)((u32)p + 0x20), *(u32*)((u32)p + 0x24), *(u32*)((u32)p + 0x28));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hotjoin: who destroys the joiner's peer record?
+//
+// Host-side peer dump shows the joiner's record cycling 3 -> 4 -> 0 every ~2.5-3 s,
+// i.e. built up to state 4 then wiped (state, f18 and f1C all zeroed) and rebuilt.
+// The link is not stalling one step short -- it is being torn down repeatedly.
+//
+// `0x170118` writes the whole record from stack args (1702b4 sw a1,8(s0) with a zero
+// param would produce exactly this) and is reachable via the API block slot 0x1D8834,
+// but its arity is unknown and it reads several stack slots, so a C wrapper risks
+// corrupting the ABI. `0x173fc0` is the safer target: 4 register args, two real jal
+// call sites, and it is the routine that (re)introduces a peer -- the prime suspect
+// for resetting an in-flight handshake every retransmit.
+//
+// Log the call and the peer's state either side of it. If state collapses to 0 across
+// this call, this is the teardown and `ra` names which caller did it:
+//   ra = 0x172d84 -> the introduce-every-peer loop at 0x172d7c
+//   ra = 0x173dc0 -> the inbound-message path at 0x173db8
+// ---------------------------------------------------------------------------
+// NOT reachable via its jal sites. Hooking 0x172d7c / 0x173db8 produced ZERO hits on
+// both machines, while the host kept logging peerconnreq with ra = 0x174164/6c/74 --
+// which are the three `jal 0x14ecd8` sites INSIDE 0x173fc0. So the function runs, just
+// not through those call sites; it is dispatched through the net API table, slot
+// 0x1d88b4, the same way worldConnect is reached via 0x1d884c. Hook the slot instead.
+#define HJ_INTRO_SLOT    (0x001d88b4)
+#define HJ_INTRO_ORIG    (0x00173fc0)
+
+static int hjIntroLogged = 0;
+
+int hjIntroducePeerHook(void * ctx, int peerIdx, int a2, int a3)
+{
+    u32 c = *(u32*)HJ_NET_CTX_PTR;
+    u32 peers = c ? *(u32*)(c + HJ_CTX_PEERS) : 0;
+    int before = -1, after = -1;
+    void * pp;
+    int ret;
+
+    if (peers && peerIdx >= 0 && peerIdx < 8) {
+        pp = internal_hjPeerLookup((void*)peers, peerIdx);
+        if (pp) before = *(int*)((u32)pp + 0x08);
+    }
+
+    ret = internal_hjIntroducePeer(ctx, peerIdx, a2, a3);
+
+    if (peers && peerIdx >= 0 && peerIdx < 8) {
+        pp = internal_hjPeerLookup((void*)peers, peerIdx);
+        if (pp) after = *(int*)((u32)pp + 0x08);
+    }
+
+    if (hjIntroLogged < 24) {
+        ++hjIntroLogged;
+        HOTJOIN_LOG("introduce: idx=%d ra=%08x a2=%08x a3=%08x state %d -> %d ret=%d\n",
+            peerIdx, (u32)__builtin_return_address(0), (u32)a2, (u32)a3,
+            before, after, ret);
+    }
+    return ret;
+}
+
+// ---------------------------------------------------------------------------
+// Hotjoin: what messages actually drive the peer record?
+//
+// 0x150dd8 is the RT handler for message type 22 (registered via `li a0,22` at
+// 0x1510a4, and present in the handler table at index 22). It does:
+//   150e10  jal 0x14f8e8         ; peer = lookup(peers, payload[1])
+//   150e18  move s2,v0           ; s2 IS the peer record
+//   150e48  sw a1,8(s2)          ; peer->0x08 = payload[0]  (the MESSAGE TYPE)
+//   150e5c  bne a1,5 ...         ; type 5 -> ctx->0x44 (0x171d18)
+//   150f98  ...                  ; type 3 -> ctx->0x94 (0x173fc0, introducePeer)
+// so the value our dump prints as "state" is overwritten with the inbound message
+// type on every one of these. Log the type and the peer it lands on, so the
+// 3 -> 4 -> 0 sequence can be read as protocol traffic rather than a teardown.
+//
+// Four register arguments, dispatched from the handler table, so wrapping is ABI-safe
+// (same shape as the aux-accept probe).
+// ---------------------------------------------------------------------------
+#define HJ_T22_TYPE   (22)
+#define HJ_T22_ORIG   (0x00150dd8)
+
+static int hjT22Installed = 0;
+static int hjT22Logged = 0;
+static u32 hjT22Orig = 0;
+
+int hjType22Hook(void * a0, void * a1, int a2, u8 * payload)
+{
+    int (*orig)(void *, void *, int, u8 *) =
+        (int (*)(void *, void *, int, u8 *))hjT22Orig;
+    int msgType = payload ? payload[0] : -1;
+    int peerIdx = payload ? payload[1] : -1;
+    int ret;
+
+    ret = orig(a0, a1, a2, payload);
+
+    if (hjT22Logged < 40) {
+        u32 c = *(u32*)HJ_NET_CTX_PTR;
+        u32 peers = c ? *(u32*)(c + HJ_CTX_PEERS) : 0;
+        void * pp = (peers && peerIdx >= 0 && peerIdx < 8)
+                  ? internal_hjPeerLookup((void*)peers, peerIdx) : 0;
+        ++hjT22Logged;
+        HOTJOIN_LOG("msg22: type=%d peerIdx=%d peer=%08x t08=%d f1C=%d ret=%d\n",
+            msgType, peerIdx, (u32)pp,
+            pp ? *(int*)((u32)pp + 0x08) : -1,
+            pp ? *(int*)((u32)pp + 0x1C) : -1, ret);
+    }
+    return ret;
+}
+
+void hjInstallType22Probe(void)
+{
+    u32 table, maxTypes;
+    u32 * slot;
+
+    if (hjT22Installed)
+        return;
+
+    table = *(u32*)HJ_RT_HANDLER_TABLE_PTR;
+    maxTypes = *(u32*)HJ_RT_MAXTYPES_PTR;
+    if (!table || !maxTypes || maxTypes > 256)
+        return;
+
+    slot = (u32*)(table + (HJ_T22_TYPE * 4));
+    if (*slot != HJ_T22_ORIG) {
+        HOTJOIN_LOG("msg22: slot22 @%08x holds %08x, expected %08x -- NOT hooked\n",
+            (u32)slot, *slot, HJ_T22_ORIG);
+        hjT22Installed = 1;
+        return;
+    }
+
+    hjT22Orig = *slot;
+    *slot = (u32)&hjType22Hook;
+    hjT22Installed = 1;
+    HOTJOIN_LOG("msg22: probe installed, slot22 @%08x\n", (u32)slot);
+}
+
+// ---------------------------------------------------------------------------
+// Hotjoin: does the mark-connected path ever run, and does type 5 ever get sent?
+//
+// 0x172898 writes the real connected marker (0x172970: peer->0x08 = 5) and is called
+// from 0x172668 only when the peer index equals peers->0x408. That field starts at 256
+// (0x14f474) and is set solely by receiving message type 5 (dispatcher branch at
+// 0x150e5c -> ctx->0x44 = 0x171d18 -> `sw a1,1032(a0)`).
+//
+// Observed: the joiner RECEIVES type 5 (so its p408 should become 0) but the host never
+// does. If this hook fires on the joiner and the host still sees no type 5, the joiner
+// completes locally without telling the host -- which is the whole bug.
+//
+// 0x172668 is a genuine `jal` (verified: the only entries into 0x172898 are that call
+// site), and the callee takes three register arguments, so HOOK_JAL is safe here.
+// ---------------------------------------------------------------------------
+#define HJ_MARKCONN_SITE (0x00172668)
+
+extern int internal_hjMarkConnected(void * peers, int peerIdx, void * out);
+extern int internal_hjSendPeerMsg(void * peers, int targetIdx);
+static int hjMarkLogged = 0;
+
+int hjMarkConnectedHook(void * peers, int peerIdx, void * out)
+{
+    int before = -1, after = -1;
+    void * pp;
+    int ret;
+
+    if (peers && peerIdx >= 0 && peerIdx < 8) {
+        pp = internal_hjPeerLookup(peers, peerIdx);
+        if (pp) before = *(int*)((u32)pp + 0x08);
+    }
+
+    ret = internal_hjMarkConnected(peers, peerIdx, out);
+
+    if (peers && peerIdx >= 0 && peerIdx < 8) {
+        pp = internal_hjPeerLookup(peers, peerIdx);
+        if (pp) after = *(int*)((u32)pp + 0x08);
+    }
+
+    if (hjMarkLogged < 16) {
+        ++hjMarkLogged;
+        HOTJOIN_LOG("markconn: idx=%d p408=%d t08 %d -> %d ret=%d\n",
+            peerIdx, peers ? *(int*)((u32)peers + 0x408) : -1, before, after, ret);
+    }
+    return ret;
+}
+
 void hjInstallPlayerBitGuard(void)
 {
     if (hjPlayerBitInstalled)
@@ -526,6 +930,15 @@ void hjInstallPlayerBitGuard(void)
     HOOK_JAL(HJ_DISCONNECT_SITE_B, &hjPeerConnectReqHook);
     HOOK_JAL(HJ_DISCONNECT_SITE_C, &hjPeerConnectReqHook);
     HOOK_JAL(HJ_DISCONNECT_SITE_D, &hjPeerConnectReqHook);
+    HOOK_JAL(HJ_MARKCONN_SITE, &hjMarkConnectedHook);
+
+    if (*(u32*)HJ_INTRO_SLOT == HJ_INTRO_ORIG) {
+        POKE_U32(HJ_INTRO_SLOT, &hjIntroducePeerHook);
+        HOTJOIN_LOG("introduce hook installed at slot %08x\n", HJ_INTRO_SLOT);
+    } else {
+        HOTJOIN_LOG("introduce slot %08x holds %08x, expected %08x -- NOT hooked\n",
+            HJ_INTRO_SLOT, *(u32*)HJ_INTRO_SLOT, HJ_INTRO_ORIG);
+    }
 
     if (*(u32*)HJ_CONNECT_SLOT == HJ_CONNECT_ORIG) {
         POKE_U32(HJ_CONNECT_SLOT, &hjConnectHook);
@@ -541,6 +954,9 @@ void hjInstallPlayerBitGuard(void)
 #else
 void hjInstallPlayerBitGuard(void) { }
 void hjInstallAuxAcceptProbe(void) { }
+void hjFixMissingPads(void) { }
+void hjDumpPeers(void) { }
+void hjInstallType22Probe(void) { }
 void hjRefreshPeerActivity(void) { }
 #endif
 #define HOTJOIN_LOG_MAX_FRAMES      (240)

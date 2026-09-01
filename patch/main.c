@@ -79,6 +79,9 @@ int patchCreateGame(void *ui, long pad);
 int patchStaging(void * ui, long pad);
 void hjInstallPlayerBitGuard(void);
 void hjInstallAuxAcceptProbe(void);
+void hjFixMissingPads(void);
+void hjDumpPeers(void);
+void hjInstallType22Probe(void);
 void hjRefreshPeerActivity(void);
 // int patchBuddies(void * ui, long pad);
 // int patchPlayerDetails(void * ui, long pad);
@@ -3033,6 +3036,9 @@ int main(void)
 	// that printf reaches the EE console, independently of whether staging is entered.
 	hjInstallPlayerBitGuard();
 	hjInstallAuxAcceptProbe();
+	hjFixMissingPads();
+	hjInstallType22Probe();
+	hjDumpPeers();
 	hjRefreshPeerActivity();
 	{
 		static int hjHeartbeat = 0;

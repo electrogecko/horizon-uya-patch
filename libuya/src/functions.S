@@ -397,6 +397,10 @@ FUNCTION(netSetHeartbeatInterval, 0x0014bf08)
 FUNCTION(internal_hjResolvePlayerCtx, 0x0016ed00)
 FUNCTION(internal_hjSendPeerConnectReq, 0x0014ecd8)
 FUNCTION(internal_hjPeerConnectCtor, 0x00199ba0)
+FUNCTION(internal_hjPeerLookup, 0x0014f8e8)
+FUNCTION(internal_hjIntroducePeer, 0x00173fc0)
+FUNCTION(internal_hjMarkConnected, 0x00172898)
+FUNCTION(internal_hjSendPeerMsg, 0x0014bdb0)
 #endif
 #ifdef UYA_PAL
 FUNCTION(internal_netUpdatetNWGameSettings, 0x006d4ed8)
