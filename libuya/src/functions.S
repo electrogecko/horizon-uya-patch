@@ -393,6 +393,11 @@ FUNCTION(internal_netSendMessage, 0x0014ac48)
 FUNCTION(internal_netSendAppMessage, 0x0014ad08)
 FUNCTION(netInterfaceControl, 0x00148b40)
 FUNCTION(netSetHeartbeatInterval, 0x0014bf08)
+#ifndef UYA_PAL
+FUNCTION(internal_hjResolvePlayerCtx, 0x0016ed00)
+FUNCTION(internal_hjSendPeerConnectReq, 0x0014ecd8)
+FUNCTION(internal_hjPeerConnectCtor, 0x00199ba0)
+#endif
 #ifdef UYA_PAL
 FUNCTION(internal_netUpdatetNWGameSettings, 0x006d4ed8)
 #else

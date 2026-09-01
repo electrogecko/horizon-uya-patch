@@ -105,3 +105,22 @@ void gameSetClientName(int cliendId, char* name)
     strncpy(gs->PlayerNames[cliendId], name, 0x16);
     internal_netUpdatetNWGameSettings(CLIENT_UPDATE_A0, 0, name, gs->PlayerSkins[cliendId], gs->PlayerTeams[cliendId], gs->PlayerStates[cliendId], (u32)gs + 0x80);
 }
+
+//--------------------------------------------------------
+void gameSyncSettings(void)
+{
+    GameSettings* gs = gameGetSettings();
+    if (!gs)
+        return;
+    
+    #if UYA_PAL
+    u32 netCtx = *(u32*)0x0024d760;
+    #else
+    u32 netCtx = *(u32*)0x0024d860;
+    #endif
+    if (!netCtx || !*(u32*)netCtx)
+        return;
+
+    internal_netUpdatetNWGameSettings(CLIENT_UPDATE_A0, 0, gs->PlayerNames[0], gs->PlayerSkins[0], gs->PlayerTeams[0], gs->PlayerStates[0], (u32)gs + 0x80);
+}
+

@@ -146,6 +146,13 @@ enum CustomMessageId
     CUSTOM_MSG_ID_CLIENT_SET_GAME_STATE = 25,
 
     /*
+     * Temporary hot-join diagnostics. Sent to the lobby server, which logs it as an
+     * unhandled custom message with the payload hex. Used because EE printf is not
+     * visible in the current PCSX2 log configuration. Remove once IG join works.
+     */
+    CUSTOM_MSG_ID_HOTJOIN_DEBUG = 26,
+
+    /*
      * Sent to server for game details/state
      */
     CUSTOM_MSG_PLAYER_SYNC_STATE_UPDATE = 27,

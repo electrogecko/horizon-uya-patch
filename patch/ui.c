@@ -146,6 +146,405 @@ requestTeamChange_Func requestTeamChange = (requestTeamChange_Func)OPTION_REQUES
 extern isConfigMenuActive;
 extern mapOverrideResponse;
 
+// --- hot-join instrumentation (temporary) --------------------------------
+// printf goes to the PCSX2 EE console. Uses printf directly rather than
+// DPRINTF so it does not require -DDEBUG, which would enable every DPRINTF
+// in the patch at 60fps. Remove once the in-game join path is understood.
+#define HOTJOIN_LOG(fmt, args...)   printf("HJ " fmt, ##args)
+
+// ---------------------------------------------------------------------------
+// Hotjoin: guard the per-player registration that faults for a late joiner.
+//
+// A joiner that reaches staging via the hotjoin path dies with
+//   R5900 TLB Miss, addr=0x7c  [load] then [store]
+// The faulting pair is at 0x199c98 / 0x199ca0 (PCSX2 reports the recompiled
+// block address 0x199c6c, not the instruction). Reconstructed:
+//
+//   void f(void *a0, void *a1, int playerIndex) {           // 0x199c40
+//       if (playerIndex == -2) return;
+//       void *out = NULL;
+//       if (resolve(&out, a1) != 0) return;
+//       void *ctx = out->0x1C;
+//       int   idx = ctx->0x54;
+//       void *obj = (0x22F550 + idx * 3184)->0x04;          // NULL for a hotjoiner
+//       obj->0x7C |= (1 << playerIndex);                    // <-- faults
+//   }
+//
+// The function has no direct callers; it is reached through the vtable slot at
+// 0x1DD970, so we replace it there the same way patchStaging replaces the
+// staging handler. This is a diagnostic, not a fix: skipping the bit leaves the
+// joiner unregistered with whatever subsystem this is. The point is to find out
+// whether this is the only broken structure or the first of many, and to log
+// idx so we can tell a legitimately-NULL object from a garbage table index.
+// ---------------------------------------------------------------------------
+#ifndef UYA_PAL
+#define HJ_PLAYERBIT_VTABLE_SLOT    (0x001dd970)
+#define HJ_PLAYERBIT_TABLE_BASE     (0x0022f550)
+#define HJ_PLAYERBIT_TABLE_STRIDE   (3184)
+#define HJ_PLAYERBIT_TABLE_MAXIDX   (64)
+
+extern int internal_hjResolvePlayerCtx(void ** out, void * arg);
+extern void internal_hjPeerConnectCtor(void * a0, void * a1);
+
+static int hjPlayerBitInstalled = 0;
+static int hjPlayerBitSkips = 0;
+static int hjPlayerBitSeen = 0;
+
+void hjRegisterPlayerBit(void * a0, void * a1, int playerIndex)
+{
+    void * out = 0;
+
+    if (playerIndex == -2)
+        return;
+
+    if (internal_hjResolvePlayerCtx(&out, a1) != 0)
+        return;
+
+    if (!out) {
+        HOTJOIN_LOG("playerbit: out=NULL idx? player=%d\n", playerIndex);
+        return;
+    }
+
+    u32 ctx = *(u32*)((u32)out + 0x1C);
+    if (!ctx) {
+        HOTJOIN_LOG("playerbit: ctx=NULL player=%d\n", playerIndex);
+        return;
+    }
+
+    int idx = *(int*)(ctx + 0x54);
+    if (idx < 0 || idx >= HJ_PLAYERBIT_TABLE_MAXIDX) {
+        HOTJOIN_LOG("playerbit: idx=%d OUT OF RANGE player=%d\n", idx, playerIndex);
+        return;
+    }
+
+    u32 obj = *(u32*)(HJ_PLAYERBIT_TABLE_BASE + (idx * HJ_PLAYERBIT_TABLE_STRIDE) + 0x04);
+    if (!obj) {
+        // Construct-on-demand instead of masking. The game's own OnPeerConnect
+        // handler at 0x199ba0 is the constructor of this entry: it resolves the
+        // same a1, and if entry->0x04 is NULL it initializes the entry, stores
+        // the peer pointer into entry->0x04 and zeroes peer->0x7C -- the exact
+        // field the code below ORs into. On a hotjoin it never fires because the
+        // host's peer record pre-exists by the time host traffic arrives, so the
+        // create-on-first-sight path (0x172dc0 -> 0x16f208) is skipped. It is
+        // idempotent (checks entry->0x04), touches only local state, and the one
+        // hotjoin attempt where it happened to run got noticeably further.
+        internal_hjPeerConnectCtor(a0, a1);
+        obj = *(u32*)(HJ_PLAYERBIT_TABLE_BASE + (idx * HJ_PLAYERBIT_TABLE_STRIDE) + 0x04);
+        HOTJOIN_LOG("playerbit: ctor-on-demand idx=%d id=%d -> obj=%08x\n",
+            idx, playerIndex, obj);
+    }
+    if (!obj) {
+        if ((hjPlayerBitSkips % 60) == 0)
+            HOTJOIN_LOG("playerbit: SKIP obj=NULL idx=%d id=%d ra=%08x n=%d\n",
+                idx, playerIndex, (u32)__builtin_return_address(0), hjPlayerBitSkips);
+        ++hjPlayerBitSkips;
+        return;
+    }
+
+    // Identify what this object is on a join where it exists. The first word of a
+    // PS2 C++ object is its vtable pointer, which we can look up in the overlay to
+    // name the class -- that tells us exactly which structure a hotjoiner is missing.
+    if (!hjPlayerBitSeen) {
+        hjPlayerBitSeen = 1;
+        HOTJOIN_LOG("playerbit: OK obj=%08x idx=%d id=%d ra=%08x\n",
+            obj, idx, playerIndex, (u32)__builtin_return_address(0));
+    }
+
+    *(u32*)(obj + 0x7C) |= (1 << playerIndex);
+}
+
+// ---------------------------------------------------------------------------
+// Hotjoin: find (and optionally delay) the client-side give-up.
+//
+// A hotjoiner aborts ~250ms after connecting -- it emits 00-12-01 twice and then
+// RT_MSG_CLIENT_DISCONNECT -- while a working join needs ~3.1s. Nothing the server
+// sends can matter inside that window, so the race has to be closed on the client.
+//
+// 0x14ecd8 is the disconnect routine: it calls internal_netSendMessage with
+// t0 = 1 = RT_MSG_CLIENT_DISCONNECT. It has exactly four call sites in the resident
+// copy. Redirect all four through a pass-through that reports which one fired, so
+// we can identify the abort path. Unlike every other diagnostic left in this file,
+// this one keys off the FAILING case, which is reproducible on demand.
+//
+// Pure pass-through for now -- it changes no behaviour, it only reports.
+// The give-up is a peer-timeout sweep at 0x14f120:
+//
+//   if (ctx->0xE4 + 3000 < now && ctx->0x430 == 1)
+//       for (i = 0; i < ctx->0x43C; ++i)
+//           if (peer(i) && i != myIndex && peer->0x1C)
+//               disconnect(i);            // <-- 0x14f19c, the site that fired
+//
+// 3000 is a millisecond deadline, and a working join takes ~3.1s -- so a hotjoiner
+// only gets in when it happens to press JOIN early in that free-running window.
+// That is the whole race. Widen the deadline instead of trying to win it.
+#define HJ_PEER_TIMEOUT_INSN  (0x0014f12c)   // addiu v0,v0,3000
+#define HJ_PEER_TIMEOUT_NEW   (0x24427530)   // addiu v0,v0,30000
+
+// The sweep accumulates its own clock (clk->0x50 += delta) and that accumulator
+// jumps discontinuously -- 21015 -> 2927161 observed in one step. Refreshing
+// ctx->0xE4 every frame keeps "stale" at one frame (~16ms) and STILL loses, because
+// any jump larger than the 3000ms window expires us instantly. So stop the comparison
+// instead of chasing the timestamp:
+//
+//   14f130: sltu v0,v0,a1    ->  move v0,zero
+//   14f134: beqz v0,0x14f1d0     (now always taken; v0 is dead afterwards)
+//
+// This disables ONLY the peer-timeout sweep. Fine for a test sandbox; it would need
+// gating before it went anywhere near a real build.
+#define HJ_SWEEP_CMP_INSN (0x0014f130)
+#define HJ_SWEEP_CMP_ORIG (0x0045102b)   // sltu v0,v0,a1
+#define HJ_SWEEP_CMP_NEW  (0x0000102d)   // move v0,zero
+
+#define HJ_NET_CTX_PTR    (0x001A1CF0)
+#define HJ_NET_CLOCK_PTR  (0x001A1CB8)
+#define HJ_CTX_LAST_ACT   (0xE4)
+#define HJ_CTX_PEERS      (0xE8)
+#define HJ_CLOCK_NOW      (0x50)
+
+#define HJ_DISCONNECT_SITE_A  (0x0014f19c)
+#define HJ_DISCONNECT_SITE_B  (0x0017415c)
+#define HJ_DISCONNECT_SITE_C  (0x00174164)
+#define HJ_DISCONNECT_SITE_D  (0x0017416c)
+
+extern void internal_hjSendPeerConnectReq(int idx);   // 0x14ecd8
+
+
+void hjPeerConnectReqHook(int idx)
+{
+    u32 ra = (u32)__builtin_return_address(0);
+
+    // Report only -- this is the outgoing peer-connect request, not a disconnect.
+    {
+        u32 c = *(u32*)HJ_NET_CTX_PTR;
+        HOTJOIN_LOG("peerconnreq: idx=%d ra=%08x ctx=%08x lastRetry=%u menus=%d gs=%p\n",
+            idx, ra, c, c ? *(u32*)(c + HJ_CTX_LAST_ACT) : 0,
+            isInMenus(), gameGetSettings());
+    }
+
+    internal_hjSendPeerConnectReq(idx);
+}
+
+// The sweep at 0x14f120 drops every peer when
+//
+//     ctx->0xE4 + 3000 < now        ctx = *(0x001A1CF0), now = (*(0x001A1CB8))->0x50
+//
+// ctx->0xE4 is a last-activity stamp that ordinary traffic keeps fresh. A hotjoiner's
+// is stale or never set, so the deadline is already blown when it arrives -- which is
+// why widening the 3000 constant did nothing, and why the failure looked like a race
+// (it depends on where in the free-running window you press JOIN).
+//
+// Keep the stamp fresh while we are in menus instead of blocking the disconnect. The
+// sweep still runs and still reaps genuinely dead peers everywhere else; we just stop
+// looking dead ourselves. Every frame rather than once, because a single refresh only
+// buys 3s and a normal join needs ~3.1s.
+
+static int hjRefreshes = 0;
+
+void hjRefreshPeerActivity(void)
+{
+    return;   // superseded by the sweep-comparison patch
+
+    if (!isInMenus())
+        return;
+
+    u32 ctx = *(u32*)HJ_NET_CTX_PTR;
+    if (!ctx || !*(u32*)(ctx + HJ_CTX_PEERS))
+        return;
+
+    u32 clk = *(u32*)HJ_NET_CLOCK_PTR;
+    if (!clk)
+        return;
+
+    u32 now = *(u32*)(clk + HJ_CLOCK_NOW);
+    u32 last = *(u32*)(ctx + HJ_CTX_LAST_ACT);
+
+    // Refresh UNCONDITIONALLY every frame. Making this conditional on
+    // "(last + 3000) < now" was wrong: it only fires once the deadline has ALREADY
+    // passed, so it races the sweep inside the same frame and loses about half the
+    // time. Observed cycle was refresh -> 3s -> sweep fires with exactly the value we
+    // had written. A keepalive has to run before expiry, not after it.
+    if (hjRefreshes < 4 || (hjRefreshes % 600) == 0)
+        HOTJOIN_LOG("peeract: ctx=%08x last=%u now=%u stale=%d n=%d\n",
+            ctx, last, now, (int)(now - last), hjRefreshes);
+    ++hjRefreshes;
+
+    *(u32*)(ctx + HJ_CTX_LAST_ACT) = now;
+}
+
+// ---------------------------------------------------------------------------
+// Hotjoin: expose failure mode B (dies before ctx->0xE8 populates).
+//
+// The world-connect API is at 0x16f770(params, out), reached only through the
+// pointer slot 0x1D884C inside the API block at 0x1D8820. It is SYNCHRONOUS:
+// it validates, allocates from the RT pool (0x14a4f0 -> 0x14c1e8), assigns the
+// peer table into ctx->0xE8, sends the connect, then pumps the net for up to
+// 30s waiting for ctx->0x10C (server accept). Distinct error returns:
+//   16 = API busy flag (0x1D8908) still set from a previous attempt
+//   22 = pool record alloc failed (0x14a4f0 returned NULL)
+//   23/38/15/8 = param validation
+//   14 (out state 2) = 30s accept timeout, cleanup via 0x171ee8
+// Both 16 and 22 are progressive-leak shaped -- prime mode-B suspects. This
+// wrapper logs entry/exit so a silent failure becomes a named error, and
+// "never called at all" becomes a diagnosis too (failure is then upstream in
+// the medius/TCP stage, visible in DME logs).
+// ---------------------------------------------------------------------------
+#define HJ_CONNECT_SLOT       (0x001d884c)
+#define HJ_CONNECT_ORIG       (0x0016f770)
+#define HJ_API_BUSY_FLAG      (0x001d8908)
+#define HJ_CTX_ACCEPT         (0x10C)
+
+static int hjConnectCalls = 0;
+
+int hjConnectHook(void * params, u32 * out)
+{
+    int (*orig)(void *, u32 *) = (int (*)(void *, u32 *))HJ_CONNECT_ORIG;
+    u32 clk = *(u32*)HJ_NET_CLOCK_PTR;
+    u32 t0 = clk ? *(u32*)(clk + HJ_CLOCK_NOW) : 0;
+    u32 busy = *(u32*)HJ_API_BUSY_FLAG;
+    u32 * p = (u32*)params;
+    int n = ++hjConnectCalls;
+
+    HOTJOIN_LOG("connect[%d] IN params=%08x out=%08x busy=%08x ctx=%08x\n",
+        n, (u32)params, (u32)out, busy, *(u32*)HJ_NET_CTX_PTR);
+    if (p)
+        HOTJOIN_LOG("connect[%d] p0=%08x p4=%08x p8=%08x pC=%08x p14=%08x p18=%08x\n",
+            n, p[0], p[1], p[2], p[3], p[5], p[6]);
+
+    int ret = orig(params, out);
+
+    u32 ctx = *(u32*)HJ_NET_CTX_PTR;
+    u32 t1 = clk ? *(u32*)(clk + HJ_CLOCK_NOW) : 0;
+    HOTJOIN_LOG("connect[%d] OUT ret=%d out0=%u out1=%u out2=%u accept=%08x busy=%08x dt=%u\n",
+        n, ret, out ? out[0] : 0, out ? out[1] : 0, out ? out[2] : 0,
+        ctx ? *(u32*)(ctx + HJ_CTX_ACCEPT) : 0, *(u32*)HJ_API_BUSY_FLAG, t1 - t0);
+    return ret;
+}
+
+// ---------------------------------------------------------------------------
+// Hotjoin: prove whether SERVER_CONNECT_ACCEPT_AUX_UDP (RT type 25) ever
+// reaches the game. Server logs show every hotjoin attempt's UDP hello
+// arriving and 3x accepts being sent back, yet the client aborts as if the
+// accept never landed -- so the question is whether the loss is inbound
+// (PCSX2 DEV9) or the accept is processed and some other gate fails.
+//
+// RT message handlers are registered via 0x151550(type, stack, fn) into a
+// table at *(0x001A294C), slot = table + (stack*maxTypes + type)*4; stack 0.
+// The table is allocated at net-init, not boot, so installation is deferred:
+// call hjInstallAuxAcceptProbe() every frame until it sticks.
+// ---------------------------------------------------------------------------
+#define HJ_RT_HANDLER_TABLE_PTR   (0x001A294C)
+#define HJ_RT_MAXTYPES_PTR        (0x001D2370)   // 0x1D2374 is MAX_STACKS, not maxTypes
+#define HJ_RT_TYPE_ACCEPT_AUX_UDP (25)
+#define HJ_AUX_ACCEPT_ORIG        (0x0014B500)
+#define HJ_RT_MAX_STACKS          (4)
+
+static int hjAuxAcceptInstalled = 0;
+static int hjAuxAcceptCount = 0;
+static u32 hjAuxAcceptOrig = 0;
+
+int hjAuxAcceptHook(void * a0, void * a1, void * a2, void * a3)
+{
+    int (*orig)(void *, void *, void *, void *) =
+        (int (*)(void *, void *, void *, void *))hjAuxAcceptOrig;
+    int n = ++hjAuxAcceptCount;
+    if (n <= 8)
+        HOTJOIN_LOG("auxaccept[%d]: a0=%08x a1=%08x a2=%08x a3=%08x\n",
+            n, (u32)a0, (u32)a1, (u32)a2, (u32)a3);
+    return orig(a0, a1, a2, a3);
+}
+
+void hjInstallAuxAcceptProbe(void)
+{
+    if (hjAuxAcceptInstalled)
+        return;
+
+    u32 table = *(u32*)HJ_RT_HANDLER_TABLE_PTR;
+    u32 maxTypes = *(u32*)HJ_RT_MAXTYPES_PTR;
+    if (!table || !maxTypes || maxTypes > 256)
+        return;
+
+    // Handlers are registered per protocol stack: 0x151550 passes stack 0, 0x151578
+    // passes stack 2, so slot = table + (stack*maxTypes + type)*4. A previous version
+    // hooked stack 0 only and stayed silent even on SUCCESSFUL joins, which proved
+    // nothing except that the aux-UDP accept is dispatched on a different stack.
+    // Hook every stack whose slot 25 holds the expected handler, and report the lot.
+    int hooked = 0;
+    int stack;
+    for (stack = 0; stack < HJ_RT_MAX_STACKS; ++stack) {
+        u32 * slot = (u32*)(table + ((stack * maxTypes) + HJ_RT_TYPE_ACCEPT_AUX_UDP) * 4);
+        HOTJOIN_LOG("auxaccept: stack%d slot25 @%08x = %08x\n", stack, (u32)slot, *slot);
+        if (*slot == HJ_AUX_ACCEPT_ORIG) {
+            hjAuxAcceptOrig = *slot;
+            *slot = (u32)&hjAuxAcceptHook;
+            ++hooked;
+        }
+    }
+
+    hjAuxAcceptInstalled = 1;
+    HOTJOIN_LOG("auxaccept: maxTypes=%d, hooked %d stack(s)\n", (int)maxTypes, hooked);
+}
+
+void hjInstallPlayerBitGuard(void)
+{
+    if (hjPlayerBitInstalled)
+        return;
+
+    hjPlayerBitInstalled = 1;
+    // VERIFY BEFORE PATCHING. The clean NETGUI_NTGUI.ELF and the RAM dump disagree
+    // about what lives at these addresses, so read what is ACTUALLY there at runtime
+    // before writing anything. Expected from the dump:
+    //   0x0014f19c = 0c053b36 (jal 0x14ecd8)   0x0014f12c = 24420bb8 (addiu v0,v0,3000)
+    // Expected from the clean ELF:
+    //   0x0014f19c = 8e030004 (lw v1,4(s0))    -- if we see this, the hooks are WRONG
+    //                                             and must not be installed.
+    HOTJOIN_LOG("verify: 14f19c=%08x 14f12c=%08x 14ecd8=%08x 1dd970=%08x 199c98=%08x\n",
+        *(u32*)0x0014f19c, *(u32*)0x0014f12c, *(u32*)0x0014ecd8,
+        *(u32*)HJ_PLAYERBIT_VTABLE_SLOT, *(u32*)0x00199c98);
+
+    if (*(u32*)HJ_DISCONNECT_SITE_A != 0x0c053b36 ||
+        *(u32*)HJ_SWEEP_CMP_INSN != HJ_SWEEP_CMP_ORIG) {
+        HOTJOIN_LOG("verify: MISMATCH -- hooks NOT installed\n");
+        return;
+    }
+
+    // DO NOT patch HJ_SWEEP_CMP_INSN. An earlier version wrote `move v0,zero` there
+    // to "stop the peer-timeout sweep from disconnecting us". That reading was wrong:
+    //   0x14ecd8 allocates a slot in the 28-byte-stride table at 0x1FA718 (0x14eb50,
+    //   returns 127 when full) and sends internal message id 1 -- it is a TRACKED
+    //   PEER-CONNECT REQUEST, not a disconnect. 0x173fc0 issues it three times for
+    //   redundancy when introducing a peer, and the loop at 0x14f120 re-issues it to
+    //   every not-yet-connected peer, rate-limited to once per 3000 ms by ctx->0xE4,
+    //   which 0x14f1c8 stamps with `now` after the loop.
+    // So this block is the RETRY for peer connection setup. Disabling it left every
+    // join with exactly one chance for its connect request to survive, which is why
+    // joins looked like pure packet loss and got worse as DEV9 grew lossier.
+    // ctx->0xE4 starting at 0 is correct: it makes the first retry fire immediately.
+
+    POKE_U32(HJ_PLAYERBIT_VTABLE_SLOT, &hjRegisterPlayerBit);
+
+    HOOK_JAL(HJ_DISCONNECT_SITE_A, &hjPeerConnectReqHook);
+    HOOK_JAL(HJ_DISCONNECT_SITE_B, &hjPeerConnectReqHook);
+    HOOK_JAL(HJ_DISCONNECT_SITE_C, &hjPeerConnectReqHook);
+    HOOK_JAL(HJ_DISCONNECT_SITE_D, &hjPeerConnectReqHook);
+
+    if (*(u32*)HJ_CONNECT_SLOT == HJ_CONNECT_ORIG) {
+        POKE_U32(HJ_CONNECT_SLOT, &hjConnectHook);
+        HOTJOIN_LOG("connect hook installed at slot %08x\n", HJ_CONNECT_SLOT);
+    } else {
+        HOTJOIN_LOG("connect slot %08x holds %08x, expected %08x -- NOT hooked\n",
+            HJ_CONNECT_SLOT, *(u32*)HJ_CONNECT_SLOT, HJ_CONNECT_ORIG);
+    }
+
+    HOTJOIN_LOG("guards installed: playerbit %08x, retransmit INTACT, 4 peer-connect-req sites\n",
+        HJ_PLAYERBIT_VTABLE_SLOT);
+}
+#else
+void hjInstallPlayerBitGuard(void) { }
+void hjInstallAuxAcceptProbe(void) { }
+void hjRefreshPeerActivity(void) { }
+#endif
+#define HOTJOIN_LOG_MAX_FRAMES      (240)
+
 char changeTeamStr[] = "Change Team";
 char kickPlayerStr[] = "Kick Player";
 char addBuddyStr[] = "Add to Buddies";
@@ -559,6 +958,7 @@ void openTeamsOptions(GameSettings * gs, int isTeams)
 int patchStaging(UiMenu_t* ui, int pad)
 {
     static int init_staging = 0;
+    static int hjLogFrames = HOTJOIN_LOG_MAX_FRAMES;
     static int allPlayersReady = -1;
     static int pressedL1 = -1;
     static int holdingL1time = 0; 
@@ -570,6 +970,30 @@ int patchStaging(UiMenu_t* ui, int pad)
     int itemSelected = *(int*)((u32)ui + 0x290);
     int isLoading = *(u8*)((u32)ui + 0x2b6);
     int isRequstingTeamChange = *(u8*)((u32)ui + 0x2c8);
+
+    // Hot-join instrumentation (temporary): fires on entry, before any early return,
+    // so we can tell "staging never entered" apart from "logging not working".
+    {
+        static int hjEntry = 0;
+        if ((hjEntry % 30) == 0) {
+            printf("HJ enter e=%d host=%d gs=%p cid=%d lobbyConn=%p\n",
+                hjEntry, gameAmIHost(), gs, clientId, netGetLobbyServerConnection());
+            if (hjEntry < 900) {
+                u8 ebuf[8];
+                ebuf[0] = 0xE0;                        /* tag: patchStaging entered */
+                ebuf[1] = (u8)(hjEntry / 30);
+                ebuf[2] = (u8)(gameAmIHost() & 0xFF);
+                ebuf[3] = (u8)(gs ? 1 : 0);
+                ebuf[4] = (u8)(clientId & 0xFF);
+                ebuf[5] = (u8)(netGetLobbyServerConnection() ? 1 : 0);
+                ebuf[6] = 0;
+                ebuf[7] = 0;
+                netSendCustomAppMessage(netGetLobbyServerConnection(),
+                    NET_LOBBY_CLIENT_INDEX, CUSTOM_MSG_ID_HOTJOIN_DEBUG, 8, ebuf);
+            }
+        }
+        ++hjEntry;
+    }
 
     // check for connetion
     if (!netGetLobbyServerConnection())
@@ -598,6 +1022,56 @@ int patchStaging(UiMenu_t* ui, int pad)
 	// call game function we're replacing
 	int result = stagingFunc(ui, pad);
 
+    // Dump the joining client's view of staging each frame, so we can see what it
+    // observes in the handful of frames before it gives up and disconnects.
+    if (gs && !gameAmIHost() && hjLogFrames < HOTJOIN_LOG_MAX_FRAMES) {
+        int hj;
+        int mySlot = -1;
+        char hjName[17];
+
+        for (hj = 0; hj < GAME_MAX_PLAYERS; ++hj) {
+            if (gs->PlayerClients[hj] == clientId) { mySlot = hj; break; }
+        }
+
+        HOTJOIN_LOG("f=%d res=%d cid=%d slot=%d hostState=%d load=%d teamReq=%d mapResp=%d\n",
+            hjLogFrames, result, clientId, mySlot, gs->PlayerStates[0],
+            isLoading, isRequstingTeamChange, mapOverrideResponse);
+        HOTJOIN_LOG("f=%d clients=%d %d %d %d %d %d %d %d\n", hjLogFrames,
+            gs->PlayerClients[0], gs->PlayerClients[1], gs->PlayerClients[2], gs->PlayerClients[3],
+            gs->PlayerClients[4], gs->PlayerClients[5], gs->PlayerClients[6], gs->PlayerClients[7]);
+        HOTJOIN_LOG("f=%d states=%d %d %d %d %d %d %d %d\n", hjLogFrames,
+            gs->PlayerStates[0], gs->PlayerStates[1], gs->PlayerStates[2], gs->PlayerStates[3],
+            gs->PlayerStates[4], gs->PlayerStates[5], gs->PlayerStates[6], gs->PlayerStates[7]);
+        if (mySlot >= 0) {
+            for (hj = 0; hj < 16; ++hj) hjName[hj] = gs->PlayerNames[mySlot][hj];
+            hjName[16] = 0;
+            HOTJOIN_LOG("f=%d me slot=%d state=%d team=%d name='%s'\n",
+                hjLogFrames, mySlot, gs->PlayerStates[mySlot], gs->PlayerTeams[mySlot], hjName);
+        }
+        {
+            u8 dbuf[28];
+            int k;
+            dbuf[0] = 0xF1;                            /* tag: staging frame snapshot */
+            dbuf[1] = (u8)(hjLogFrames & 0xFF);
+            dbuf[2] = (u8)(mySlot & 0xFF);
+            dbuf[3] = (u8)(gs->PlayerStates[0] & 0xFF);
+            for (k = 0; k < GAME_MAX_PLAYERS; ++k) dbuf[4 + k]  = (u8)(gs->PlayerClients[k] & 0xFF);
+            for (k = 0; k < GAME_MAX_PLAYERS; ++k) dbuf[12 + k] = (u8)(gs->PlayerStates[k] & 0xFF);
+            dbuf[20] = (u8)(isLoading & 0xFF);
+            dbuf[21] = (u8)(isRequstingTeamChange & 0xFF);
+            dbuf[22] = (u8)(clientId & 0xFF);
+            dbuf[23] = (u8)(mapOverrideResponse & 0xFF);
+            dbuf[24] = (u8)(result & 0xFF);
+            dbuf[25] = (u8)(mySlot >= 0 ? gs->PlayerTeams[mySlot] : 0xFF);
+            dbuf[26] = 0;
+            dbuf[27] = 0;
+            netSendCustomAppMessage(netGetLobbyServerConnection(),
+                NET_LOBBY_CLIENT_INDEX, CUSTOM_MSG_ID_HOTJOIN_DEBUG, 28, dbuf);
+        }
+
+        ++hjLogFrames;
+    }
+
     //  init staging if not done already, or equals 2
     if (!init_staging || info.currentWorldId != gameGetWorldId()) {
         getBuddyList(BUDDY_LIST_STACK, 2);
@@ -609,6 +1083,7 @@ int patchStaging(UiMenu_t* ui, int pad)
         memset(info.buddies, -1, sizeof(info.buddies));
         memset(info.ignored, -1, sizeof(info.ignored));
         init_staging = 1;
+        hjLogFrames = 0;
     }
 
     // if host
@@ -656,10 +1131,36 @@ int patchStaging(UiMenu_t* ui, int pad)
             }
         }
     } else {
-        // Nont Host Stuff
+        // Non-Host Stuff
         // Make it so all clients can scroll over users names
         if (*(u32*)OPTIONS_SCROLL_CHECK == 0x24050001)
             *(u32*)OPTIONS_SCROLL_CHECK = 0x24050003;
+
+        // Auto-join when entering staging while host is already in-game.
+        // Observed on the wire: an in-game host reports PlayerStates[0] == 8,
+        // which is one past GS_PLAYER_STATE_GAME_START (7) and undocumented in
+        // eGS_PlayerStates. Accept both so this fires for loading and playing.
+        if (gs->PlayerStates[0] >= GS_PLAYER_STATE_GAME_START) {
+            for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
+                if (gs->PlayerClients[i] == clientId) {
+                    // Auto-balance team if unassigned
+                    if (isTeams && gs->PlayerTeams[i] < 0) {
+                        int blueCount = 0, redCount = 0;
+                        int p;
+                        for (p = 0; p < GAME_MAX_PLAYERS; ++p) {
+                            if (p != i && gs->PlayerClients[p] > -1) {
+                                if (gs->PlayerTeams[p] == 0) blueCount++;
+                                else if (gs->PlayerTeams[p] == 1) redCount++;
+                            }
+                        }
+                        gs->PlayerTeams[i] = (redCount < blueCount) ? 1 : 0;
+                    }
+                    // Auto-ready to begin streaming and load active map
+                    gs->PlayerStates[i] = 6;
+                    break;
+                }
+            }
+        }
 
         // Unkick (never worked)
         // for (i = 0; i < GAME_MAX_PLAYERS; ++i) {

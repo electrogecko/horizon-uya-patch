@@ -77,6 +77,9 @@ void onMapLoaderOnlineMenu(void);
 
 int patchCreateGame(void *ui, long pad);
 int patchStaging(void * ui, long pad);
+void hjInstallPlayerBitGuard(void);
+void hjInstallAuxAcceptProbe(void);
+void hjRefreshPeerActivity(void);
 // int patchBuddies(void * ui, long pad);
 // int patchPlayerDetails(void * ui, long pad);
 // int patchStats(void * ui, int pad);
@@ -2534,6 +2537,27 @@ void patchColors(void)
 }
 
 /*
+ * NAME :		runHotjoinHostSync
+ * DESCRIPTION :
+ * 			When host is in-game, periodically send NWGameSettings so any
+ * 			clients joining live from the lobby receive the game settings
+ * 			and can transition into staging/gameplay.
+ */
+void runHotjoinHostSync(void)
+{
+	static int syncTimer = 0;
+	if (!isInGame() || !gameAmIHost()) {
+		syncTimer = 0;
+		return;
+	}
+
+	if (++syncTimer >= 5) { // every 5 frames (~80ms)
+		syncTimer = 0;
+		gameSyncSettings();
+	}
+}
+
+/*
  * NAME :		runGameStartMessager
  * DESCRIPTION :
  * NOTES :
@@ -3001,6 +3025,22 @@ int main(void)
 	// sends game started message to server
 	// when host (us) start the game
 	runGameStartMessager();
+
+	// periodically sync game settings to DME when host is in-game for hotjoiners
+	runHotjoinHostSync();
+
+	// Hot-join instrumentation heartbeat (temporary). Proves the patch is loaded and
+	// that printf reaches the EE console, independently of whether staging is entered.
+	hjInstallPlayerBitGuard();
+	hjInstallAuxAcceptProbe();
+	hjRefreshPeerActivity();
+	{
+		static int hjHeartbeat = 0;
+		if ((hjHeartbeat % 120) == 0)
+			printf("HJ alive hb=%d menus=%d game=%d host=%d gs=%p\n",
+				hjHeartbeat, isInMenus(), isInGame(), gameAmIHost(), gameGetSettings());
+		++hjHeartbeat;
+	}
 
 	// 
 	runCheckGameMapInstalled();

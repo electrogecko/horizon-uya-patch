@@ -130,5 +130,7 @@ void gameSetClientState(int cliendId, int state);
 void gameSetClientTeam(int cliendId, int team);
 void gameSetClientSkin(int cliendId, int skin);
 void gameSetClientName(int cliendId, char* name);
+void gameSyncSettings(void);
+void internal_netUpdatetNWGameSettings(int stack, int isLocalSelected, char* name, int skin, int team, int state, int gs);
 
 #endif // _LIBUYA_GAMESETTINGS_H_
