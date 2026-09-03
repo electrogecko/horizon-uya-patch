@@ -731,7 +731,10 @@ void hjDumpDispatch(void)
     u32 * p;
     int i;
 
-    if (done) return;
+    // The callback slots are only populated by vaInitNetworkedGameplaySystems,
+    // which runs at level load -- dumping at boot would read zeros and waste
+    // the run. Wait until we are actually in a game.
+    if (done || !isInGame() || isInMenus()) return;
     done = 1;
 
     // The registration/invoke family around 0x001999a8.
