@@ -530,12 +530,19 @@ void hjInstallAuxAcceptProbe(void)
 #define HJ_PS_SEQ       (HJ_PS_STREAM + 0x1E1)   /* 0x44ED, +1 per packet sent   */
 #define HJ_PLAYER_MPIDX_OFF (0x2544)
 
-// 0x2412F0 was derived statically from the constructor (525c4c addiu $2,$2,4848) but a
-// runtime dump proved it wrong -- slots 4..7 hold floats (3f800000 = 1.0f, 3c888889 =
-// 1/60), so this is not a pointer array. The guarded write never fired, which is the
-// only reason nothing got corrupted. Keep dumping it for reference; never write to it
-// until a run shows entries that actually look like pads.
+// 0x2412F0 IS the pad pointer table, and it is what the constructor reads:
+//   525c48  lui   $2,0x24
+//   525c4c  addiu $2,$2,4848      ; 0x002412F0
+//   525c50  lw    $6,112($29)     ; local player index * 4
+//   525c60  addu  $5,$6,$2
+//   525c80  lw    $4,0($5)        ; pPad = table[idx]
+//   525c84  sw    $4,9524($18)    ; player->pPad
+// An earlier note here claimed a runtime dump had "proved it wrong" because slots
+// 4..7 held floats (1.0f, 1/60). Those slots are simply not part of the table --
+// only 0..3 are pointers, one per local pad. The dump was reading past the end.
+#define HJ_PAD_PTRS         (4)
 static int hjPadTableLogged = 0;
+static int hjPadTableSeeded = 0;
 static int hjPadFillLogged = 0;
 static int hjPlayerMapLogged = 0;
 
@@ -554,12 +561,38 @@ void hjFixMissingPads(void)
     u32 * table = (u32*)HJ_PAD_TABLE;
     int i, valid = 0, spare = 1;
 
-    if (isInMenus())
+    // Must be BOTH out of menus and in a live game. Leaving a game passes
+    // through menus=0/game=0 for several seconds, and everything below writes
+    // into structures the engine is tearing down in exactly that window.
+    // Guarding only on isInMenus() let this run during teardown and crashed
+    // both consoles on exit -- see the padhook note below.
+    if (isInMenus() || !isInGame())
         return;
 
-    for (i = 0; i < HJ_PAD_SLOTS; ++i)
+    for (i = 0; i < HJ_PAD_PTRS; ++i)
         if (hjLooksLikePad(table[i]))
             ++valid;
+
+    // THE actual fix, as opposed to the two repairs below it.
+    //
+    // On a hot-join the table is still all-zero when playerCreateLocalForSlot
+    // runs, so it reads pPad = NULL and its two follow-up stores
+    //   *(pPad + 0x56C) = producer ;  *(pPad + 0x570) = player + 0x430C
+    // fault into low memory and are lost. Seeding the entry BEFORE the
+    // constructor runs lets the constructor do its own job: it installs the
+    // producer itself, which means we no longer hardcode 0x00534568 -- an
+    // address that is per-level overlay and would be wrong on other maps.
+    //
+    // Only slot 0: a client has exactly one local player, and a healthy load
+    // shows table[0] = 0x00225900 with 1..3 zero. Guarded on the entry being
+    // zero, so this is a no-op on a normal load and cannot fight the engine.
+    if (!table[0]) {
+        table[0] = HJ_PAD_P1;
+        if (!hjPadTableSeeded) {
+            hjPadTableSeeded = 1;
+            HOTJOIN_LOG("padseed: table[0] was NULL -> %08x (before ctor)\n", table[0]);
+        }
+    }
 
     if (hjPadTableLogged < 3) {
         ++hjPadTableLogged;
@@ -637,7 +670,7 @@ void hjFixMissingPads(void)
                 *ppad = HJ_PAD_P1;
                 if (hjPadFillLogged < 4) {
                     ++hjPadFillLogged;
-                    HOTJOIN_LOG("padfill: LOCAL slot=0 mpIndex=%d pPad NULL -> %08x\n",
+                    HOTJOIN_LOG("padfill: FALLBACK FIRED - LOCAL slot=0 mpIndex=%d pPad NULL -> %08x\n",
                         mpIndex, *ppad);
                 }
             }
@@ -668,10 +701,27 @@ void hjFixMissingPads(void)
             // and the "walks forward, cannot shoot" behaviour.
             //
             // So finish the constructor's job: install the two words it lost.
-            if (*ppad && *(u32*)(*ppad + 0x56C) != HJ_PADSTREAM_PRODUCER) {
+            //
+            // FALLBACK ONLY as of the padseed above. Seeding table[0] before the
+            // constructor runs means the constructor installs the producer itself,
+            // using its own per-overlay address rather than our hardcoded one. If
+            // "padhook: FALLBACK FIRED" ever appears in a log, the seed landed too
+            // late and the hook point needs moving earlier -- do not just accept
+            // the repair, it reintroduces the per-map address problem.
+            // Fire ONLY when the slot is empty. The previous condition was
+            // "!= HJ_PADSTREAM_PRODUCER", i.e. "not Metropolis's producer, so
+            // force Metropolis's producer in" -- which stomps the correct
+            // producer on every other level. The pad struct at 0x00225900 is
+            // static and outlives a level, but 0x00534568 is a Metropolis
+            // OVERLAY address; once another overlay loads, that memory is
+            // different code and padPollControllerAndUpdate jalrs straight
+            // into it. No TLB miss, because the address is still mapped. That
+            // crashed host and joiner ~0.1s after the lobby's GuiMemoryMap on
+            // a normal quit-to-lobby.
+            if (*ppad && *(u32*)(*ppad + 0x56C) == 0) {
                 *(u32*)(*ppad + 0x56C) = HJ_PADSTREAM_PRODUCER;
                 *(u32*)(*ppad + 0x570) = (u32)p + HJ_PS_STREAM;
-                HOTJOIN_LOG("padhook: pPad=%08x +0x56C=%08x +0x570=%08x (was ready=%d curFrame=%d)\n",
+                HOTJOIN_LOG("padhook: FALLBACK FIRED - pPad=%08x +0x56C=%08x +0x570=%08x (was ready=%d curFrame=%d)\n",
                     *ppad, *(u32*)(*ppad + 0x56C), *(u32*)(*ppad + 0x570),
                     *(int*)((u32)p + HJ_PS_READY), *(int*)((u32)p + HJ_PS_CURFRAME));
             }
