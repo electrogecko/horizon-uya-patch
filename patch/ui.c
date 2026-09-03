@@ -751,6 +751,34 @@ void hjDumpDispatch(void)
         HOTJOIN_LOG("cbslot %08x: %08x %08x %08x %08x\n",
             (u32)(p + i), p[i], p[i+1], p[i+2], p[i+3]);
     }
+
+    // Find the DELETE invoker. The create invoker reads its callback as
+    //   3c020024  lui v0,0x24
+    //   8c4207d0  lw  v0,0x07d0(v0)
+    // so the delete twin must contain an lw with offset 0x07D4, or the
+    // gp-relative form lw rX,-0x796c(gp) = offset 0x8694 (the registration
+    // stores use exactly those two encodings). Scan base-exe code for lw
+    // (opcode 0x23) with either offset and print the surrounding words, so
+    // the invoker is identified from evidence rather than guessed -- calling
+    // a wrong address here would be a jump into arbitrary code.
+    {
+        u32 * scan = (u32*)0x00100000;
+        u32 * end  = (u32*)0x00200000;
+        int hits = 0;
+        while (scan < end && hits < 20) {
+            u32 w = *scan;
+            if ((w >> 26) == 0x23) {
+                u32 off = w & 0xFFFF;
+                if (off == 0x07D4 || off == 0x8694) {
+                    HOTJOIN_LOG("cbref %08x: %08x %08x %08x %08x %08x\n",
+                        (u32)(scan - 1), scan[-1], scan[0], scan[1], scan[2], scan[3]);
+                    ++hits;
+                }
+            }
+            ++scan;
+        }
+        HOTJOIN_LOG("cbref: %d hit(s)\n", hits);
+    }
 }
 
 // ---------------------------------------------------------------------------
