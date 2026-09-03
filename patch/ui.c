@@ -584,14 +584,44 @@ void hjFixMissingPads(void)
             int mpIndex = *(int*)((u32)p + HJ_PLAYER_MPIDX_OFF);
 
             if (hjPlayerMapLogged < 8) {
+                // Dump the POINTER table, not the storage array.
+                //
+                // playerGetAll() returns Player** -- the list the game itself iterates
+                // (see playerPadUpdate). playerGetFromSlot(i) returns the i'th STORAGE
+                // slot, which is a valid address whether or not anyone occupies it; that
+                // is why it always handed back 0x2f77c0 + i*0x4500 and why slot 4 is
+                // uninitialised 0xcdcdcdcd. Reading storage told us the host had one
+                // player while it was visibly rendering a second one in a vehicle -- a
+                // remote player's Player struct need not live in that static array at all.
+                // Print both: the pointer table entry, and whether it aims inside the
+                // static array or somewhere else entirely.
+                Player ** all = playerGetAll();
                 int j;
                 for (j = 0; j < GAME_MAX_PLAYERS; ++j) {
-                    Player * q = playerGetFromSlot(j);
-                    if (!q) continue;
-                    ++hjPlayerMapLogged;
-                    HOTJOIN_LOG("playermap: slot=%d player=%08x mpIndex=%d pPad=%08x\n",
-                        j, (u32)q, *(int*)((u32)q + HJ_PLAYER_MPIDX_OFF),
-                        *(u32*)((u32)q + HJ_PLAYER_PPAD_OFF));
+                    Player * q = all ? all[j] : 0;
+                    u32 qa = (u32)q;
+                    int inArr = (qa >= 0x2f77c0 && qa < 0x2f77c0 + (8 * 0x4500)
+                                 && ((qa - 0x2f77c0) % 0x4500) == 0);
+                    if (!q) {
+                        HOTJOIN_LOG("plist: [%d] NULL\n", j);
+                        continue;
+                    }
+                    // pNetPlayer (Player+0x2558, per player.h:1231) is the argument the remote-player
+                    // constructor takes. Chain found in the Metropolis overlay decomp:
+                    //   vaInitNetworkedGameplaySystems -> func_0x001999a8(
+                    //       playerCreateRemoteForSession)   ; stores cb at 0x002407D0
+                    //   0x001999b8(NWPlayer *p): v0 = *(0x002407D0); jalr v0;
+                    //                            p->0x1a6 = 1 (bCallbackCalled)
+                    // playerCreateRemoteForSession is what allocates the vanilla host's
+                    // heap Player (0x00311e80). If the hot-join host's net layer already
+                    // holds an NWPlayer for the joiner, calling 0x1999b8 on it should let
+                    // the level's own constructor build the player.
+                    HOTJOIN_LOG("plist: [%d] %08x %s mpIndex=%d pMoby=%08x pPad=%08x team=%d veh=%08x pNet=%08x\n",
+                        j, qa, inArr ? "static" : "HEAP",
+                        *(int*)(qa + HJ_PLAYER_MPIDX_OFF),
+                        *(u32*)(qa + 0x2524), *(u32*)(qa + HJ_PLAYER_PPAD_OFF),
+                        *(int*)(qa + 0x2548), *(u32*)(qa + 0x2528),
+                        *(u32*)(qa + 0x2558));
                 }
                 hjPlayerMapLogged = 8;
             }
@@ -624,9 +654,394 @@ void hjFixMissingPads(void)
 //   0x1C = "eligible to receive a connect request" (checked by the retransmit loop)
 // ---------------------------------------------------------------------------
 static int hjPeerDumps = 0;
-static int hjAnnounceDone = 0;
-static int hjAnnounceSends = 8;   // resend a few times; a single datagram can be lost
 static u32 hjLastPeerSig = 0;
+
+// ---------------------------------------------------------------------------
+// hjAnnounce -- finish the announce step the joiner's connect path skipped.
+//
+// 0x16f7d8 (connect) contains:
+//   16fa68  bnez v0,0x16fac0   ; if (s6 | peers->0x438) != 0 -> SKIP
+//   16fa70  li v0,5
+//   16fa78  sw v0,8(s0)        ; myRecord->0x08 = 5
+//   16fa80  sw s2,24(s0)       ; myRecord->0x18 = 1
+// Runtime shows peers->0x438 == 1 for the whole of connect, clearing only once the
+// HOST's type-5 arrives -- after connect has passed the check. Nothing re-runs that
+// block, so myRecord->0x08 stays 4 forever, and since the sender at 0x14bdb0 takes the
+// outbound type straight out of myRecord->0x08 the joiner can never emit type 5.
+//
+// Perform the skipped assignment once, when the preconditions the original block would
+// have seen are true: our record is at 4 (introduce done) and 0x438 has cleared. Then
+// drive the send ourselves -- setting the field is not sufficient, because the 3 and 4
+// the host receives are emitted during the connect handshake and nothing sends again
+// afterwards. Deliberately NOT calling 0x171d18 as well: that overwrites peers->0x408,
+// which on the joiner legitimately points at the host.
+//
+// This MUST live outside hjDumpPeers. It used to sit after that function's
+// `sig == hjLastPeerSig || hjPeerDumps > 60` early-out, which is a log throttle: the
+// announce and every resend therefore only ran on frames where some peer's 0x08 happened
+// to change, and stopped entirely after 60 such frames. Whether the announce fired at
+// all, and how many of the 8 datagrams were actually sent, was decided by unrelated peer
+// churn -- which is exactly the "sometimes lands, sometimes hangs" behaviour observed.
+// ---------------------------------------------------------------------------
+static int hjAnnounceDone = 0;
+static int hjAnnounceSends = 0;
+static int hjAnnounceTick = 0;
+
+// Cadence, not a burst. The first version sent 12 datagrams over 2.4 s, which the log
+// showed were ALL spent while the joiner was still loading the map -- the player did not
+// spawn until 54 s later, so by the time the joiner existed in the game the announce had
+// been over for nearly a minute and the host had nothing live to match. Announce at 1 Hz
+// for as long as the join is in progress instead, so the window spans the load and, more
+// importantly, continues after spawn.
+#define HJ_ANNOUNCE_MAX_SENDS   (240)  // ~4 min at 1 Hz; a cap, not an expected count
+#define HJ_ANNOUNCE_PERIOD      (60)   // frames between resends (~1 s at 60 Hz)
+
+void hjAnnounce(void)
+{
+    u32 ctx = *(u32*)HJ_NET_CTX_PTR;
+    u32 peers, mine;
+
+    if (isInMenus()) {
+        // Rearm for the next join attempt, so a retry is a clean run rather than
+        // inheriting a spent send budget from the attempt that failed.
+        hjAnnounceDone = 0;
+        hjAnnounceSends = 0;
+        hjAnnounceTick = 0;
+        return;
+    }
+
+    if (!ctx)
+        return;
+    peers = *(u32*)(ctx + HJ_CTX_PEERS);
+    if (!peers)
+        return;
+    mine = *(u32*)(peers + 0x400);
+    if (!mine)
+        return;
+
+    if (*(u32*)(peers + 0x438) == 0 && *(int*)(mine + 0x08) == 4) {
+        *(int*)(mine + 0x08) = 5;
+        *(int*)(mine + 0x18) = 1;
+        hjAnnounceSends = 0;
+        hjAnnounceTick = 0;
+        if (!hjAnnounceDone) {
+            hjAnnounceDone = 1;
+            HOTJOIN_LOG("announce: myRecord %08x 0x08 -> 5, 0x18 -> 1 (p438=0), sending\n",
+                mine);
+        }
+    }
+
+    // Retransmit: these are UDP datagrams and this protocol demonstrably depends on
+    // repetition (the game's own peer-connect request retries every ~3 s). Space them
+    // out rather than firing the whole budget in consecutive frames.
+    if (*(int*)(mine + 0x08) == 5 && hjAnnounceSends < HJ_ANNOUNCE_MAX_SENDS) {
+        if (--hjAnnounceTick <= 0) {
+            hjAnnounceTick = HJ_ANNOUNCE_PERIOD;
+            ++hjAnnounceSends;
+            internal_hjSendPeerMsg((void*)peers, -1);
+            // 1 Hz for minutes would flood the console; log the early ones (the load
+            // phase) then sample, so the tail is still visible without drowning the rest.
+            if (hjAnnounceSends <= 5 || (hjAnnounceSends % 10) == 0)
+                HOTJOIN_LOG("announce: send %d/%d game=%d p408=%d\n",
+                    hjAnnounceSends, HJ_ANNOUNCE_MAX_SENDS,
+                    isInGame(), *(int*)(peers + 0x408));
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// hjDumpRoster -- the GameSettings player roster, on BOTH machines, every frame,
+// in menus AND in-game.
+//
+// Why this is the thing to watch now. A vanilla two-player join (both clients through
+// staging) was captured on the same build as a reference, and it killed every lead the
+// peer layer had produced: `playerbit ... id=-1`, the joiner's `p408=0`, and the
+// `peerconnreq` retry firing every 3 s forever all occur in a join that WORKS. Even the
+// announce fix fires in vanilla -- a record sitting at 4 with p438==0 is the game's
+// ordinary state at that moment, not a hot-join defect.
+//
+// The one thing vanilla has that hot-join does not is the staging roster negotiation:
+//   f=19  clients=0 1 -1 -1 -1 -1 -1 -1   states=6 6 0 0 0 0 0 0
+//   f=86  hostState=7                     states=7 6 ...
+// gs->PlayerClients[] is how the host learns a joiner exists AS A PLAYER, and it is
+// negotiated on the staging screen. Hot-join skips staging entirely, so the host's PEER
+// table gets the joiner (p408=1, type-5 both ways) while its PLAYER roster never does --
+// a connected peer with no player entity, which is exactly what is on screen.
+//
+// The existing f= dump only runs inside the staging UI hook, which a hot-joiner never
+// enters; that is why hot-join logs contain no f= lines at all. This one is deliberately
+// independent of that hook so we can see the roster on the host while it is in-game.
+//
+// Logged on change, plus a heartbeat, and the budget refills via hjLogEpochTock -- a
+// one-shot cap goes quiet exactly during the long session we care about, which has now
+// cost two rounds of measurement (the 40-message type-22 cap, and the peer-dump cap).
+// ---------------------------------------------------------------------------
+static int hjRosterDumps = 0;
+static u32 hjLastRosterSig = 0;
+static int hjRosterBeat = 0;
+
+
+// ---------------------------------------------------------------------------
+// hjHostAdoptPeers -- write the roster entry the host's staging loop would have
+// written, but never does while it is in-game.
+//
+// Established chain, both sides logged plus the server's own probe output:
+//   1. The joiner broadcasts its staging announce (00-0F, carrying its name). The DME
+//      world forwards broadcasts to every client, so THE HOST RECEIVES IT -- the server
+//      log shows the name being read out of that very message
+//      ("injected roster slot 1 (\"Gtr4\")", 241x).
+//   2. In staging, the host's staging loop consumes that announce, writes the roster
+//      slot, and answers the joiner's 02-13 poll with 02-12.
+//   3. In-game, that loop is not running. The host never writes the slot, and never
+//      sends 02-12 (the server already fakes the 02-12 on its behalf).
+//   4. Every server-side fix so far points AT THE JOINER: TryInjectHotjoinSlot rewrites
+//      the host->joiner settings snapshot in flight (World.cs:416, gated
+//      source.DmeId == 0 && targetDmeId > 0). Nothing writes the HOST's own copy, and
+//      the host is the producer of those snapshots, not a consumer -- so no amount of
+//      server-side work can inform it. It has to do it itself.
+//
+// Result, captured on both machines at the same moment:
+//   HOST:   clients=0 -1 -1 ...  states=8 0 0 ...   n=1
+//   JOINER: clients=0  1 -1 ...  states=8 6 0 ...   n=1
+// A connected peer (p408=1, type-5 both ways) with no player entity on the host.
+//
+// Slot == client id == DmeId == peer index: the server injects at slot = targetDmeId,
+// and the joiner (cid=1) landed in slot 1, so the host can derive the mapping from the
+// peer index alone without parsing the announce.
+//
+// NOTE: this tests whether the roster is the ONLY thing gating visibility. It may not
+// be -- in staging the host runs a real add-player path with downstream effects (spawn,
+// pad binding, HUD), and poking fields does not run any of that. "Roster now correct,
+// still no player" is a real possible outcome, and would point at the in-game
+// waiting-for-players / readiness gate as the place the actual admit-player work lives.
+// ---------------------------------------------------------------------------
+static int hjAdopted = 0;          // bitmask of slots we have already written
+
+void hjHostAdoptPeers(void)
+{
+    GameSettings * gs = gameGetSettings();
+    u32 ctx, peers;
+    int i, count;
+
+    if (isInMenus()) {
+        hjAdopted = 0;      // rearm, so a retry is a clean run
+        return;
+    }
+    if (!gs)
+        return;
+
+    // Recompute PlayerCount on BOTH machines. It sits at 1 on the host and, more
+    // tellingly, at 1 on the joiner as well -- even though the joiner's clients[] has two
+    // entries. Vanilla reaches 2. The joiner's roster arrives via our injected snapshot,
+    // which only rewrites the arrays inside the first 0x100 bytes and never touches
+    // PlayerCount at 0x178, so its roster has been half-built all along.
+    count = 0;
+    for (i = 0; i < GAME_MAX_PLAYERS; ++i)
+        if (gs->PlayerClients[i] >= 0)
+            ++count;
+
+    if (!gameAmIHost()) {
+        if (count > 0 && gs->PlayerCount != count) {
+            HOTJOIN_LOG("adopt: joiner PlayerCount %d -> %d\n", gs->PlayerCount, count);
+            gs->PlayerCount = count;
+        }
+        return;
+    }
+
+    ctx = *(u32*)HJ_NET_CTX_PTR;
+    if (!ctx)
+        return;
+    peers = *(u32*)(ctx + HJ_CTX_PEERS);
+    if (!peers)
+        return;
+
+    for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
+        void * p;
+        if (i == *(int*)(peers + 0x404))          // skip ourselves
+            continue;
+        if (hjAdopted & (1 << i))                 // write once per slot, not per frame
+            continue;
+        if (gs->PlayerClients[i] >= 0)            // already present
+            continue;
+
+        p = internal_hjPeerLookup((void*)peers, i);
+        if (!p || *(int*)((u32)p + 0x08) != 5)    // only fully-connected peers
+            continue;
+
+        gs->PlayerClients[i] = (short)i;
+        gs->PlayerStates[i]  = gs->PlayerStates[*(int*)(peers + 0x404)];
+        gs->PlayerTeams[i]   = 0;
+        gs->PlayerSkins[i]   = 0;
+        gs->PlayerTypes[i]   = 0;
+        {
+            /* placeholder name; the real one is in the 00-0F announce we do not parse yet */
+            const char * nm = "Hotjoiner";
+            int k;
+            for (k = 0; k < 16; ++k)
+                gs->PlayerNames[i][k] = (k < 9) ? nm[k] : 0;
+        }
+        gs->PlayerCount = count + 1;
+        hjAdopted |= (1 << i);
+        HOTJOIN_LOG("adopt: host wrote roster slot %d (client %d, state %d), n -> %d\n",
+            i, i, gs->PlayerStates[i], gs->PlayerCount);
+    }
+}
+
+// hjDumpNWPlayers -- the tNW_Player array, on BOTH machines.
+//
+// The array is STATIC, so its addresses are the same on host and joiner:
+//   0x199a00:  li a0,3184; lui v0,0x23; lbu v1,1(a1); addiu v0,v0,-2736;
+//              mult v1,v1,a0; addu v1,v1,v0      ->  0x0022F550 + idx*0xC70
+// Confirmed live: a joiner's plist showed pNet=0022f550 (idx 0) and
+// 002301c0 (idx 1), exactly base and base+0xC70.
+//
+// That matters because it means the argument to 0x001999b8 (the "spawn remote
+// player" entry that calls the level's playerCreateRemoteForSession) does not
+// have to be handed to us by the net layer -- it is a fixed address. What is
+// still unknown is whether the HOST's slot for the joiner is populated or is
+// just a zeroed slice of a static array, which is what this prints.
+#define HJ_NWPLAYER_BASE   (0x0022F550)
+#define HJ_NWPLAYER_STRIDE (0xC70)
+
+static int hjNwDumps = 0;
+static u32 hjLastNwSig = 0;
+
+void hjDumpNWPlayers(void)
+{
+    u32 sig = 0;
+    int i;
+
+    for (i = 0; i < 2; ++i) {
+        u32 p = HJ_NWPLAYER_BASE + (i * HJ_NWPLAYER_STRIDE);
+        sig = (sig * 31) + *(u32*)(p + 0x00) + *(u32*)(p + 0x04)
+            + (u32)*(short*)(p + 0x1a2) + (u32)*(short*)(p + 0x1a6)
+            + (u32)*(unsigned char*)(p + 0x68)
+            + *(u32*)(p + 0xc34) + *(u32*)(p + 0xc38) + *(u32*)(p + 0xc44);
+    }
+    if (sig == hjLastNwSig || hjNwDumps > 20)
+        return;
+    hjLastNwSig = sig;
+    ++hjNwDumps;
+
+    for (i = 0; i < 2; ++i) {
+        u32 p = HJ_NWPLAYER_BASE + (i * HJ_NWPLAYER_STRIDE);
+        HOTJOIN_LOG("nwp: [%d] %08x cid=%d pData=%08x flags=%08x bLocal=%d spawned=%d cbCalled=%d\n",
+            i, p,
+            *(int*)(p + 0x00), *(u32*)(p + 0x04), *(u32*)(p + 0x14),
+            (int)*(char*)(p + 0x68),
+            (int)*(short*)(p + 0x1a2), (int)*(short*)(p + 0x1a6));
+        // The pad-input pipeline. A remote player on the host moves by replaying
+        // decoded pad messages; if that stream stalls, the last frame repeats
+        // forever, which looks exactly like walking in the facing direction with
+        // yaw still tracking (rotation rides on the state message, not the pad).
+        HOTJOIN_LOG("nwp: [%d] pad decodePos=%d frame=%d seq=%d buffered=%d rcvFrame=%d thr=%d skips=%d act=%08x tail=%08x\n",
+            i,
+            (int)*(char*)(p + 0xc30), (int)*(char*)(p + 0xc31),
+            *(int*)(p + 0xc34), *(int*)(p + 0xc38), *(int*)(p + 0xc3c),
+            (int)*(signed char*)(p + 0xc41), (int)*(char*)(p + 0xc42),
+            *(u32*)(p + 0xc44), *(u32*)(p + 0xc48));
+    }
+}
+
+extern void internal_hjSpawnRemotePlayer(void * nwPlayer);
+
+// hjHostSpawnRemotes -- the missing call.
+//
+// Established across four captures:
+//   - a CLIENT builds every player at level load from the roster (static slots);
+//     a HOST builds its own at load and allocates remotes dynamically on join.
+//   - in a hot-join the host's tNW_Player for the joiner is fully populated
+//     (cid=1, real pNetPlayerData, spawned=1) and stays that way indefinitely --
+//     only bCallbackCalled stays 0, i.e. 0x1999b8 was never invoked for it.
+//   - on a joiner, bCallbackCalled flips to 1 for the REMOTE and stays 0 for the
+//     LOCAL, which is what says the flag tracks playerCreateRemoteForSession.
+//
+// So the record is ready and nothing consumes it. Call the game's own entry point
+// and let the level's constructor build the Player, rather than synthesising one.
+//
+// Deliberately conservative: host only, in-game only, and only for a slot that
+// has a populated NWPlayer, no Player in the pointer table, and bCallbackCalled
+// still clear. 0x1999b8 sets that flag itself, so this cannot fire twice for a
+// slot -- but keep an explicit mask too, since a constructor of 2352 instructions
+// run twice on one record is not something to leave to one flag.
+static int hjSpawned = 0;
+
+void hjHostSpawnRemotes(void)
+{
+    Player ** all;
+    int i, me;
+
+    if (isInMenus()) { hjSpawned = 0; return; }
+    if (!gameAmIHost() || !isInGame())
+        return;
+
+    all = playerGetAll();
+    if (!all)
+        return;
+
+    me = gameGetMyClientId();
+    for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
+        u32 nwp = HJ_NWPLAYER_BASE + (i * HJ_NWPLAYER_STRIDE);
+        if (i == me)                       continue;   // never the local player
+        if (hjSpawned & (1 << i))          continue;
+        if (all[i])                        continue;   // already has a Player
+        if (*(int*)(nwp + 0x00) < 0)       continue;   // no client in this slot
+        if (*(short*)(nwp + 0x1a6) != 0)   continue;   // callback already ran
+        if (*(u32*)(nwp + 0x04) == 0)      continue;   // no tNW_PlayerData
+
+        hjSpawned |= (1 << i);
+        HOTJOIN_LOG("spawn: calling 0x1999b8 for nwp[%d] %08x cid=%d pData=%08x\n",
+            i, nwp, *(int*)(nwp + 0x00), *(u32*)(nwp + 0x04));
+        internal_hjSpawnRemotePlayer((void*)nwp);
+        // Re-read the table: the constructor is what fills the entry in.
+        // (playerGetAll is only implicitly declared in this file, so it has to
+        // land in a typed local before it can be subscripted.)
+        {
+            Player ** now = playerGetAll();
+            HOTJOIN_LOG("spawn: returned; cbCalled=%d player=%08x\n",
+                (int)*(short*)(nwp + 0x1a6), now ? (u32)now[i] : 0);
+        }
+    }
+}
+
+void hjDumpRoster(void)
+{
+    GameSettings * gs = gameGetSettings();
+    u32 sig = 0;
+    int i, beat;
+
+    if (!gs)
+        return;
+
+    for (i = 0; i < GAME_MAX_PLAYERS; ++i)
+        sig = (sig * 31) + (u32)(gs->PlayerClients[i] & 0xFFFF)
+            + (u32)((gs->PlayerStates[i] & 0xFF) << 16);
+    sig = (sig * 31) + (u32)gs->PlayerCount;
+
+    beat = (++hjRosterBeat >= 300);       // ~5 s, so steady state is visible too
+    if (beat)
+        hjRosterBeat = 0;
+    if ((sig == hjLastRosterSig && !beat) || hjRosterDumps > 40)
+        return;
+    hjLastRosterSig = sig;
+    ++hjRosterDumps;
+
+    HOTJOIN_LOG("roster: host=%d game=%d menus=%d n=%d cid=%d\n",
+        gameAmIHost(), isInGame(), isInMenus(), gs->PlayerCount,
+        gameGetMyClientId());
+    HOTJOIN_LOG("roster: clients=%d %d %d %d %d %d %d %d\n",
+        gs->PlayerClients[0], gs->PlayerClients[1], gs->PlayerClients[2], gs->PlayerClients[3],
+        gs->PlayerClients[4], gs->PlayerClients[5], gs->PlayerClients[6], gs->PlayerClients[7]);
+    HOTJOIN_LOG("roster: states =%d %d %d %d %d %d %d %d\n",
+        gs->PlayerStates[0], gs->PlayerStates[1], gs->PlayerStates[2], gs->PlayerStates[3],
+        gs->PlayerStates[4], gs->PlayerStates[5], gs->PlayerStates[6], gs->PlayerStates[7]);
+    HOTJOIN_LOG("roster: teams  =%d %d %d %d %d %d %d %d  types=%d %d %d %d %d %d %d %d\n",
+        gs->PlayerTeams[0], gs->PlayerTeams[1], gs->PlayerTeams[2], gs->PlayerTeams[3],
+        gs->PlayerTeams[4], gs->PlayerTeams[5], gs->PlayerTeams[6], gs->PlayerTeams[7],
+        gs->PlayerTypes[0], gs->PlayerTypes[1], gs->PlayerTypes[2], gs->PlayerTypes[3],
+        gs->PlayerTypes[4], gs->PlayerTypes[5], gs->PlayerTypes[6], gs->PlayerTypes[7]);
+}
 
 void hjDumpPeers(void)
 {
@@ -683,65 +1098,6 @@ void hjDumpPeers(void)
     //   16fa84  jal 0x171d18      ; publish it
     // p438 is therefore the prime suspect for the whole hot-join stall. Print it, plus
     // p400 (my own record pointer) and its 0x08, so we can see the sender's actual input.
-    // ---- FIX (experiment): finish the announce step the joiner skipped ----
-    // 0x16f7d8 (connect) contains:
-    //   16fa68  bnez v0,0x16fac0   ; if (s6 | peers->0x438) != 0 -> SKIP
-    //   16fa70  li v0,5
-    //   16fa78  sw v0,8(s0)        ; myRecord->0x08 = 5
-    //   16fa80  sw s2,24(s0)       ; myRecord->0x18 = 1
-    // Runtime shows peers->0x438 == 1 while connect runs, and it only clears to 0 once
-    // the HOST's type-5 message arrives -- after connect has already passed the check.
-    // Nothing re-runs that block, so myRecord->0x08 stays 4 forever. Since the sender
-    // (0x14bdb0) uses myRecord->0x08 as the outbound message type, the joiner can never
-    // emit type 5 and the host never completes.
-    //
-    // Perform the skipped assignment once, only when the preconditions the original
-    // block would have seen are now true: our record is at 4 (introduce done) and 0x438
-    // has cleared. Deliberately NOT calling 0x171d18 as well: that would overwrite
-    // peers->0x408, which on the joiner legitimately points at the host, and the goal
-    // here is only to make the joiner announce itself.
-    {
-        u32 mine0 = *(u32*)(peers + 0x400);
-        if (mine0 && *(u32*)(peers + 0x438) == 0 && *(int*)(mine0 + 0x08) == 4) {
-            *(int*)(mine0 + 0x08) = 5;
-            *(int*)(mine0 + 0x18) = 1;
-            // Setting the field alone is not enough: the 3 and 4 the host receives are
-            // emitted during the connect handshake, and by the time 0x438 clears nothing
-            // sends again -- the host kept seeing only 3 and 4 with our record already at
-            // 5. So drive the send ourselves. 0x14bdb0(peers, targetIdx) is the peer
-            // message sender (RT type 22); it reads the type from myRecord->0x08, which we
-            // have just set to 5. targetIdx -1 = broadcast to every established peer.
-            hjAnnounceSends = 0;
-            if (!hjAnnounceDone) {
-                hjAnnounceDone = 1;
-                HOTJOIN_LOG("announce: myRecord %08x 0x08 -> 5, 0x18 -> 1 (p438=0), sending\n",
-                    mine0);
-            }
-        }
-    }
-
-    // REVERTED: driving the send ourselves via 0x14bdb0(peers, -1) regressed the
-    // handshake -- with it in, myRecord->0x08 stopped advancing past 3 (it previously
-    // reached 4, then 5 via the announce fix) and joins failed or hung. One attempt is
-    // thin evidence, but an unproven write into the send path is not worth carrying while
-    // the rest works, so it is out. If revisited: find why calling the sender outside its
-    // normal sequence disturbs the handshake, rather than re-adding it blind.
-
-    // Setting myRecord->0x08 is not sufficient on its own: the 3 and 4 the host receives
-    // are emitted during the connect handshake, and once 0x438 clears nothing sends again
-    // -- the host kept seeing only 3 and 4 while our record already read 5. So drive the
-    // send. 0x14bdb0(peers, targetIdx) is the peer message sender (RT type 22); it takes
-    // the outbound type from myRecord->0x08, which the block above has set to 5.
-    // targetIdx -1 = broadcast to every established peer. Repeat a few times: these are
-    // UDP datagrams and this protocol demonstrably depends on retransmission.
-    {
-        u32 mine1 = *(u32*)(peers + 0x400);
-        if (mine1 && *(int*)(mine1 + 0x08) == 5 && hjAnnounceSends < 8) {
-            ++hjAnnounceSends;
-            internal_hjSendPeerMsg((void*)peers, -1);
-        }
-    }
-
     {
         u32 mine = *(u32*)(peers + 0x400);
         HOTJOIN_LOG("peers: me=%d n=%d gate=%d p408=%d p438=%08x mine=%08x mine08=%d ---\n",
@@ -846,8 +1202,38 @@ int hjIntroducePeerHook(void * ctx, int peerIdx, int a2, int a3)
 #define HJ_T22_ORIG   (0x00150dd8)
 
 static int hjT22Installed = 0;
-static int hjT22Logged = 0;
 static u32 hjT22Orig = 0;
+
+// Log budgets are refilled every HJ_LOG_EPOCH frames rather than spent once for the
+// life of the process. Both the peer dump and the type-22 hook previously used one-shot
+// caps, which go quiet exactly during a long session -- i.e. during the part we care
+// about. A rolling window keeps output bounded while still covering the whole run.
+#define HJ_LOG_EPOCH   (1800)   // ~30 s at 60 Hz
+static unsigned char hjT22Seen[16][8];
+static int hjLogEpochTick = 0;
+
+void hjLogEpochTock(void)
+{
+    int t, p;
+    if (++hjLogEpochTick < HJ_LOG_EPOCH)
+        return;
+    hjLogEpochTick = 0;
+    hjPeerDumps = 0;
+    hjLastPeerSig = 0;
+    hjRosterDumps = 0;
+    hjLastRosterSig = 0;
+    hjNwDumps = 0;
+    hjLastNwSig = 0;
+    // The player-array dump had the same one-shot cap as the others, and it cost us a
+    // measurement: on the host it fired ONCE at 217.7s, six seconds BEFORE the roster
+    // adopt at 223.98s, so the run that finally produced a matching roster on both
+    // machines had no picture of the host's player array afterwards -- exactly the thing
+    // that says whether an entity followed the roster write.
+    hjPlayerMapLogged = 0;
+    for (t = 0; t < 16; ++t)
+        for (p = 0; p < 8; ++p)
+            hjT22Seen[t][p] = 0;
+}
 
 int hjType22Hook(void * a0, void * a1, int a2, u8 * payload)
 {
@@ -859,12 +1245,18 @@ int hjType22Hook(void * a0, void * a1, int a2, u8 * payload)
 
     ret = orig(a0, a1, a2, payload);
 
-    if (hjT22Logged < 40) {
+    // Budget per (msgType, peerIdx) pair, refilled by the log epoch below -- NOT one
+    // global counter. A single global cap of 40 was silently fatal: the host burned all
+    // 40 during one early run and then logged nothing for the next eleven minutes, so
+    // "no type=5 in the host dump" meant only "the budget was spent", not "nothing
+    // arrived". The host never returns to menus, so it can never reset on that edge.
+    if (msgType >= 0 && msgType < 16 && peerIdx >= 0 && peerIdx < 8
+        && hjT22Seen[msgType][peerIdx] < 4) {
+        ++hjT22Seen[msgType][peerIdx];
         u32 c = *(u32*)HJ_NET_CTX_PTR;
         u32 peers = c ? *(u32*)(c + HJ_CTX_PEERS) : 0;
         void * pp = (peers && peerIdx >= 0 && peerIdx < 8)
                   ? internal_hjPeerLookup((void*)peers, peerIdx) : 0;
-        ++hjT22Logged;
         HOTJOIN_LOG("msg22: type=%d peerIdx=%d peer=%08x t08=%d f1C=%d ret=%d\n",
             msgType, peerIdx, (u32)pp,
             pp ? *(int*)((u32)pp + 0x08) : -1,
@@ -1014,6 +1406,12 @@ void hjInstallPlayerBitGuard(void)
 void hjInstallPlayerBitGuard(void) { }
 void hjInstallAuxAcceptProbe(void) { }
 void hjFixMissingPads(void) { }
+void hjAnnounce(void) { }
+void hjDumpRoster(void) { }
+void hjDumpNWPlayers(void) { }
+void hjHostSpawnRemotes(void) { }
+void hjHostAdoptPeers(void) { }
+void hjLogEpochTock(void) { }
 void hjDumpPeers(void) { }
 void hjInstallType22Probe(void) { }
 void hjRefreshPeerActivity(void) { }

@@ -80,6 +80,12 @@ int patchStaging(void * ui, long pad);
 void hjInstallPlayerBitGuard(void);
 void hjInstallAuxAcceptProbe(void);
 void hjFixMissingPads(void);
+void hjAnnounce(void);
+void hjDumpRoster(void);
+void hjDumpNWPlayers(void);
+void hjHostSpawnRemotes(void);
+void hjHostAdoptPeers(void);
+void hjLogEpochTock(void);
 void hjDumpPeers(void);
 void hjInstallType22Probe(void);
 void hjRefreshPeerActivity(void);
@@ -3038,6 +3044,12 @@ int main(void)
 	hjInstallAuxAcceptProbe();
 	hjFixMissingPads();
 	hjInstallType22Probe();
+	hjLogEpochTock();
+	hjAnnounce();
+	hjHostAdoptPeers();
+	hjDumpRoster();
+	hjDumpNWPlayers();
+	hjHostSpawnRemotes();
 	hjDumpPeers();
 	hjRefreshPeerActivity();
 	{

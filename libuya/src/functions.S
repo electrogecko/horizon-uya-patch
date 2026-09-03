@@ -401,6 +401,10 @@ FUNCTION(internal_hjPeerLookup, 0x0014f8e8)
 FUNCTION(internal_hjIntroducePeer, 0x00173fc0)
 FUNCTION(internal_hjMarkConnected, 0x00172898)
 FUNCTION(internal_hjSendPeerMsg, 0x0014bdb0)
+// "spawn the remote player for this NWPlayer": loads the level-registered callback
+// from 0x002407D0 (set by vaInitNetworkedGameplaySystems via 0x001999a8 ->
+// playerCreateRemoteForSession), calls it, then sets p->bCallbackCalled (+0x1a6).
+FUNCTION(internal_hjSpawnRemotePlayer, 0x001999b8)
 #endif
 #ifdef UYA_PAL
 FUNCTION(internal_netUpdatetNWGameSettings, 0x006d4ed8)
