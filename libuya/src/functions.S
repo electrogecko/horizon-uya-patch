@@ -405,6 +405,19 @@ FUNCTION(internal_hjSendPeerMsg, 0x0014bdb0)
 // from 0x002407D0 (set by vaInitNetworkedGameplaySystems via 0x001999a8 ->
 // playerCreateRemoteForSession), calls it, then sets p->bCallbackCalled (+0x1a6).
 FUNCTION(internal_hjSpawnRemotePlayer, 0x001999b8)
+// The delete twin, confirmed by runtime dump on a Metropolis host:
+//   00199a40  addiu sp,sp,-16          <- entry, mirrors 0x001999b8
+//   00199a44  lui   v0,0x24
+//   00199a48  lw    v0,0x07d4(v0)      ; delete cb (0x0052aba0 on Metropolis)
+//   00199a5c  jalr  v0                 ; playerDeleteRemoteForSession(nwp)
+//   00199a80  beq   v0,v1,+5           ; skips the wipe if nwp is OUR OWN client
+//   00199a88  sh    zero,0x1a6(s0)     ; bCallbackCalled = 0
+//   00199a8c  sw    v0,0(s0)           ; netClientIndex  = -1
+//   00199a90  sh    zero,0x1a0(s0)
+//   00199a94  sh    zero,0x1a2(s0)     ; bSpawned        = 0
+// Clearing cid to -1 is what stops hjHostSpawnRemotes rebuilding the player
+// on the next frame; it requires cid >= 0.
+FUNCTION(internal_hjDeleteRemotePlayer, 0x00199a40)
 #endif
 #ifdef UYA_PAL
 FUNCTION(internal_netUpdatetNWGameSettings, 0x006d4ed8)

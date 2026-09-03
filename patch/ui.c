@@ -709,6 +709,10 @@ void hjFixMissingPads(void)
 }
 
 
+
+
+
+
 // ---------------------------------------------------------------------------
 // Hotjoin probe: locate the DELETE invoker.
 //
@@ -973,7 +977,7 @@ static int hjRosterBeat = 0;
 // still no player" is a real possible outcome, and would point at the in-game
 // waiting-for-players / readiness gate as the place the actual admit-player work lives.
 // ---------------------------------------------------------------------------
-static int hjAdopted = 0;          // bitmask of slots we have already written
+int hjAdopted = 0;                 // bitmask of slots we have already written
 
 void hjHostAdoptPeers(void)
 {
@@ -1101,6 +1105,140 @@ void hjDumpNWPlayers(void)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Hotjoin: reap a joiner who has left.
+//
+// An in-game host never tears down a departed hot-joiner. Measured across a
+// full join/leave/rejoin cycle, ~120s after the joiner quit:
+//     roster: clients=0 1   states=8 8
+//     nwp: [1] cid=1 spawned=1 cbCalled=1
+//     nwp: [1] pad seq=149 buffered=0 rcvFrame=1888 act=0 tail=0   (frozen)
+//     plist: [1] 00319f80 HEAP pMoby=01b2e380
+//     peerconnreq: idx=1 ... every 3s forever
+// The host keeps retransmitting connect requests at the dead peer object while
+// a returning joiner allocates a fresh one and stalls at t08=3 -- which is why
+// rejoining hangs on an infinite spinner. Missed disconnect and failed rejoin
+// are the same bug.
+//
+// This is the exact mirror of hjHostSpawnRemotes: the engine's own teardown
+// exists and is registered next to the create callback, but the loop that
+// would drive it belongs to a state an in-game host has already left. So call
+// the invoker ourselves and let playerDeleteRemoteForSession do the real work
+// -- deleting the weapon moby slots and player moby, nulling pNetPlayer,
+// clearing the pointer-table slot, migrating abandoned object owners, and
+// calling guberMobyHandlePlayerLeft. None of that is worth reimplementing.
+//
+// Staleness, not a disconnect event: +0xc34 (seq) advances once per received
+// pad message, ~15/s. If it has not moved for HJ_REAP_FRAMES while the ring is
+// drained, that client is gone.
+// ---------------------------------------------------------------------------
+#define HJ_NWP_SLOTS      (8)
+#define HJ_NW_CID         (0x00)
+#define HJ_NW_PDATA       (0x04)
+#define HJ_NW_BLOCAL      (0x68)
+#define HJ_NW_SPAWNED     (0x1a2)
+#define HJ_NW_CBCALLED    (0x1a6)
+#define HJ_NW_SEQ         (0xc34)
+#define HJ_NW_BUFFERED    (0xc38)
+// 8 seconds at 60fps. A pad stream runs at ~15/s, so this is ~120 missed
+// messages -- far beyond any lag spike, but still well inside the window
+// before a returning player tries to rejoin.
+#define HJ_REAP_FRAMES    (480)
+
+extern int hjAdopted;
+
+void hjHostReapRemotes(void)
+{
+    GameSettings * gs = gameGetSettings();
+    static int lastSeq[HJ_NWP_SLOTS];
+    static int stallFrames[HJ_NWP_SLOTS];
+    static int init = 0;
+    int i;
+
+    if (!init) {
+        init = 1;
+        for (i = 0; i < HJ_NWP_SLOTS; ++i) { lastSeq[i] = 0; stallFrames[i] = 0; }
+    }
+
+    // Host only, and only while actually in a game -- the teardown window on
+    // the way out looks identical by state and must not be touched.
+    if (!gameAmIHost() || !isInGame() || isInMenus())
+        return;
+
+    for (i = 0; i < HJ_NWP_SLOTS; ++i) {
+        u32 nwp = HJ_NWPLAYER_BASE + (i * HJ_NWPLAYER_STRIDE);
+        int cid      = *(int*)(nwp + HJ_NW_CID);
+        u32 pData    = *(u32*)(nwp + HJ_NW_PDATA);
+        int bLocal   = (int)*(char*)(nwp + HJ_NW_BLOCAL);
+        int spawned  = (int)*(short*)(nwp + HJ_NW_SPAWNED);
+        int cbCalled = (int)*(short*)(nwp + HJ_NW_CBCALLED);
+        int seq      = *(int*)(nwp + HJ_NW_SEQ);
+        int buffered = *(int*)(nwp + HJ_NW_BUFFERED);
+
+        // Only a live, remote, fully-admitted player is a candidate. The
+        // invoker refuses to wipe our own entry anyway (0x00199a80 compares
+        // against our client index), but do not even ask.
+        if (cid < 0 || !pData || bLocal || !spawned || !cbCalled
+            || cid == gameGetMyClientId()) {
+            lastSeq[i] = seq;
+            stallFrames[i] = 0;
+            continue;
+        }
+
+        // seq == 0 means this client has never sent a pad message: it is still
+        // arriving, not leaving. Reaping there would kill a joiner mid-join.
+        if (seq == 0 || seq != lastSeq[i] || buffered > 0) {
+            lastSeq[i] = seq;
+            stallFrames[i] = 0;
+            continue;
+        }
+
+        if (++stallFrames[i] < HJ_REAP_FRAMES)
+            continue;
+
+        HOTJOIN_LOG("reap: nwp[%d] %08x cid=%d seq=%d stalled %d frames -> deleting\n",
+            i, nwp, cid, seq, stallFrames[i]);
+        internal_hjDeleteRemotePlayer((void*)nwp);
+        HOTJOIN_LOG("reap: nwp[%d] after: cid=%d spawned=%d cbCalled=%d\n",
+            i, *(int*)(nwp + HJ_NW_CID),
+            (int)*(short*)(nwp + HJ_NW_SPAWNED),
+            (int)*(short*)(nwp + HJ_NW_CBCALLED));
+
+        // playerDeleteRemoteForSession clears the ENGINE state -- Player, moby,
+        // pointer-table slot -- but knows nothing about the Horizon roster slot,
+        // because we wrote that ourselves in hjHostAdoptPeers. Measured: after a
+        // successful reap the host still reported
+        //     roster: clients=0 1  states=8 8  n=2
+        //     plist: [1] NULL
+        // and a returning joiner's introduce stalled at "state 3 -> 3" forever.
+        // The host saw client 1 already present at state 8 (fully joined), so it
+        // never ran the admit sequence. Undo the adopt as well, and clear the
+        // write-once bit so a rejoin can be adopted again -- hjAdopted is only
+        // rearmed in menus, and an in-game host never goes there.
+        if (gs && cid >= 0 && cid < GAME_MAX_PLAYERS) {
+            int k, n = 0;
+            gs->PlayerClients[cid] = -1;
+            gs->PlayerStates[cid]  = 0;
+            gs->PlayerTeams[cid]   = -1;
+            gs->PlayerSkins[cid]   = 0;
+            gs->PlayerTypes[cid]   = 0;
+            for (k = 0; k < 16; ++k)
+                gs->PlayerNames[cid][k] = 0;
+            for (k = 0; k < GAME_MAX_PLAYERS; ++k)
+                if (gs->PlayerClients[k] >= 0)
+                    ++n;
+            gs->PlayerCount = n;
+            hjAdopted &= ~(1 << cid);
+            HOTJOIN_LOG("reap: roster slot %d cleared, n -> %d, adopt bit rearmed\n",
+                cid, gs->PlayerCount);
+        }
+
+        stallFrames[i] = 0;
+        lastSeq[i] = 0;
+    }
+}
+
+
 // hjDumpPadStream -- the local player's outgoing pad cadence.
 //
 // Chain (Metropolis overlay + base exe):
@@ -1206,6 +1344,7 @@ void hjHostSpawnRemotes(void)
         if (*(int*)(nwp + 0x00) < 0)       continue;   // no client in this slot
         if (*(short*)(nwp + 0x1a6) != 0)   continue;   // callback already ran
         if (*(u32*)(nwp + 0x04) == 0)      continue;   // no tNW_PlayerData
+
 
         hjSpawned |= (1 << i);
         HOTJOIN_LOG("spawn: calling 0x1999b8 for nwp[%d] %08x cid=%d pData=%08x\n",
@@ -1628,6 +1767,7 @@ void hjAnnounce(void) { }
 void hjDumpRoster(void) { }
 void hjDumpNWPlayers(void) { }
 void hjHostSpawnRemotes(void) { }
+void hjHostReapRemotes(void) { }
 void hjDumpPadStream(void) { }
 void hjHostAdoptPeers(void) { }
 void hjLogEpochTock(void) { }

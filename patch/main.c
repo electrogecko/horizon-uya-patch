@@ -86,6 +86,7 @@ void hjDumpNWPlayers(void);
 void hjHostSpawnRemotes(void);
 void hjDumpPadStream(void);
 void hjDumpDispatch(void);
+void hjHostReapRemotes(void);
 void hjHostAdoptPeers(void);
 void hjLogEpochTock(void);
 void hjDumpPeers(void);
@@ -3052,6 +3053,7 @@ int main(void)
 	hjDumpRoster();
 	hjDumpNWPlayers();
 	hjHostSpawnRemotes();
+	hjHostReapRemotes();
 	hjDumpPadStream();
 	hjDumpDispatch();
 	hjDumpPeers();
