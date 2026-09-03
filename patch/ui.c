@@ -521,6 +521,13 @@ void hjInstallAuxAcceptProbe(void)
 #define HJ_PAD_STRIDE       (0x1700)
 #define HJ_PAD_SLOTS        (8)
 #define HJ_PLAYER_PPAD_OFF  (0x2534)
+// PadStream lives at Player + 0x430C; the producer the pad poll calls into.
+#define HJ_PS_STREAM            (0x430C)
+#define HJ_PADSTREAM_PRODUCER   (0x00534568)
+// PadStream fields, relative to the Player (0x430C + the struct's own offsets).
+#define HJ_PS_CURFRAME  (HJ_PS_STREAM + 0x1D8)   /* 0x44E4, +1 per producer call */
+#define HJ_PS_READY     (HJ_PS_STREAM + 0x1DC)   /* 0x44E8, bit count, else -1   */
+#define HJ_PS_SEQ       (HJ_PS_STREAM + 0x1E1)   /* 0x44ED, +1 per packet sent   */
 #define HJ_PLAYER_MPIDX_OFF (0x2544)
 
 // 0x2412F0 was derived statically from the constructor (525c4c addiu $2,$2,4848) but a
@@ -633,6 +640,40 @@ void hjFixMissingPads(void)
                     HOTJOIN_LOG("padfill: LOCAL slot=0 mpIndex=%d pPad NULL -> %08x\n",
                         mpIndex, *ppad);
                 }
+            }
+
+            // Repairing pPad is not enough on its own. playerCreateLocalForSlot
+            // hangs the outgoing PadStream producer off the pad context:
+            //   525cb4  lw    $4,9524($18)    ; player->pPad  (+0x2534)
+            //   525cb8  addiu $3,$6,17768     ; 0x00534568, the producer
+            //   525cc8  sw    $3,1388($4)     ; *(pPad + 0x56C) = producer
+            //   525ccc  lw    $3,108($29)     ; player + 0x430C, its PadStream
+            //   525cd4  sw    $3,1392($2)     ; *(pPad + 0x570) = that stream
+            // and padPollControllerAndUpdate calls it:
+            //   488c80  lw $8,1388($16)   488c9c  lw $7,1392($16)   488ca8  jalr $8
+            //
+            // On a hot-join pPad is NULL at that moment (the pad table at
+            // 0x002412F0 is still empty), so both stores fault -- we logged
+            // "TLB Miss, pc=0x525cb0 addr=0x56c [store]" and saw
+            // "padtable @002412f0: 00000000 ... (valid=0)". The producer is
+            // therefore never installed and never runs, which leaves the
+            // PadStream zeroed: curFrame stays 0 and padStreamReady stays 0.
+            //
+            // That last value is the damage. compressedPoseCopyPayload only
+            // treats -1 as "nothing to send", so a ready of 0 returns 8 and the
+            // joiner sends a pad packet EVERY frame carrying no button data --
+            // 60/s against a consumer capped at 15/s. Measured: vanilla
+            // curFrame +60/s, seq +15/s, ready=-1; hot-join curFrame +0/s,
+            // seq +60/s, ready=0. That is both the ring overflow on the host
+            // and the "walks forward, cannot shoot" behaviour.
+            //
+            // So finish the constructor's job: install the two words it lost.
+            if (*ppad && *(u32*)(*ppad + 0x56C) != HJ_PADSTREAM_PRODUCER) {
+                *(u32*)(*ppad + 0x56C) = HJ_PADSTREAM_PRODUCER;
+                *(u32*)(*ppad + 0x570) = (u32)p + HJ_PS_STREAM;
+                HOTJOIN_LOG("padhook: pPad=%08x +0x56C=%08x +0x570=%08x (was ready=%d curFrame=%d)\n",
+                    *ppad, *(u32*)(*ppad + 0x56C), *(u32*)(*ppad + 0x570),
+                    *(int*)((u32)p + HJ_PS_READY), *(int*)((u32)p + HJ_PS_CURFRAME));
             }
         }
     }
@@ -942,6 +983,66 @@ void hjDumpNWPlayers(void)
             (int)*(signed char*)(p + 0xc41), (int)*(char*)(p + 0xc42),
             *(u32*)(p + 0xc44), *(u32*)(p + 0xc48));
     }
+}
+
+// hjDumpPadStream -- the local player's outgoing pad cadence.
+//
+// Chain (Metropolis overlay + base exe):
+//   playerCreateLocalForSlot: padCtx = *(0x002412F0 + i);
+//                             *(padCtx + 0x56C) = producer 0x00534568
+//   padPollControllerAndUpdate (0x488938) calls that hook (jalr at 0x488ca8)
+//   producer tail 0x534804:  curFrame++;  if ((curFrame & 3) == 0)
+//                                padStreamReady = cur_btn_bit_offset  -> SEND
+//                            else padStreamReady = -1                 -> no send
+//   playerUpdateLocalFrame (0x523210) sends only when copyPayload != 0,
+//   i.e. only when padStreamReady != -1.
+//
+// So one send per 4 producer calls. Vanilla measures 15.1/s on the wire, which
+// is 60/4 -- the producer runs once per frame. A hot-join host receives ~68/s,
+// so either the producer runs ~4x per frame, or curFrame does not step by 1.
+// The disassembly cannot tell those apart; these two counters can.
+//
+// PadStream lives at player + 0x430C (Ghidra's Player is 0x2600, so the
+// decomp's player[1].field_0x1eed is player + 0x44ED):
+//   +0x44E4  curFrame          -- +1 per producer call
+//   +0x44E8  padStreamReady    -- bit count when a batch is ready, else -1
+//   +0x44ED  send seq byte     -- +1 per packet actually sent
+static int hjPsTick = 0;
+static int hjPsLastFrame = 0;
+static int hjPsLastSeq = -1;
+
+void hjDumpPadStream(void)
+{
+    Player ** all;
+    u32 p;
+    int me, curFrame, seq, dFrame, dSeq;
+
+    if (isInMenus() || !isInGame()) { hjPsLastSeq = -1; hjPsTick = 0; return; }
+    if (++hjPsTick < 60)            // ~1 s at 60 Hz, so deltas read as per-second
+        return;
+    hjPsTick = 0;
+
+    all = playerGetAll();
+    if (!all)
+        return;
+    me = gameGetMyClientId();
+    if (me < 0 || me >= GAME_MAX_PLAYERS || !all[me])
+        return;
+    p = (u32)all[me];
+
+    curFrame = *(int*)(p + HJ_PS_CURFRAME);
+    seq      = (int)*(unsigned char*)(p + HJ_PS_SEQ);
+
+    if (hjPsLastSeq < 0) { hjPsLastFrame = curFrame; hjPsLastSeq = seq; return; }
+    dFrame = curFrame - hjPsLastFrame;
+    dSeq   = (seq - hjPsLastSeq) & 0xFF;   // the seq byte wraps
+    hjPsLastFrame = curFrame;
+    hjPsLastSeq   = seq;
+
+    // Expect vanilla: producer ~60/s, sends ~15/s, ratio 4.
+    HOTJOIN_LOG("padstream: curFrame=%d (+%d/s) seq=%d (+%d/s) ready=%d ratio=%d\n",
+        curFrame, dFrame, seq, dSeq, *(int*)(p + HJ_PS_READY),
+        dSeq ? (dFrame / dSeq) : -1);
 }
 
 extern void internal_hjSpawnRemotePlayer(void * nwPlayer);
@@ -1410,6 +1511,7 @@ void hjAnnounce(void) { }
 void hjDumpRoster(void) { }
 void hjDumpNWPlayers(void) { }
 void hjHostSpawnRemotes(void) { }
+void hjDumpPadStream(void) { }
 void hjHostAdoptPeers(void) { }
 void hjLogEpochTock(void) { }
 void hjDumpPeers(void) { }
