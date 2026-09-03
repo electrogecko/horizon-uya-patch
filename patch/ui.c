@@ -708,6 +708,48 @@ void hjFixMissingPads(void)
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Hotjoin probe: locate the DELETE invoker.
+//
+// vaInitNetworkedGameplaySystems registers a matched pair:
+//     func_0x001999a8(playerCreateRemoteForSession)
+//     func_0x001999b0(playerDeleteRemoteForSession)
+// and 0x001999b8 is the invoker for the CREATE side: it loads the callback
+// from 0x002407D0, jalrs it, and sets nwp->0x1a6 = 1. We already use it
+// (internal_hjSpawnRemotePlayer) to admit a hot-joiner.
+//
+// The DELETE side must have the same shape, but we have no base-exe image on
+// disk to read it from, and playerDeleteRemoteForSession itself is an OVERLAY
+// address (0x0052aba0 on Metropolis) -- calling that directly is the exact
+// mistake that crashed the joiner on Bakisi. So dump the dispatch family and
+// the callback slots and decode them offline.
+// ---------------------------------------------------------------------------
+void hjDumpDispatch(void)
+{
+    static int done = 0;
+    u32 * p;
+    int i;
+
+    if (done) return;
+    done = 1;
+
+    // The registration/invoke family around 0x001999a8.
+    p = (u32*)0x001999a0;
+    for (i = 0; i < 32; i += 4) {
+        HOTJOIN_LOG("disp %08x: %08x %08x %08x %08x\n",
+            (u32)(p + i), p[i], p[i+1], p[i+2], p[i+3]);
+    }
+
+    // The callback slots. 0x002407D0 is the create callback; the delete one
+    // should sit next to it, and on an in-game host both must be non-zero.
+    p = (u32*)0x002407C8;
+    for (i = 0; i < 8; i += 4) {
+        HOTJOIN_LOG("cbslot %08x: %08x %08x %08x %08x\n",
+            (u32)(p + i), p[i], p[i+1], p[i+2], p[i+3]);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Hotjoin: why does the host<->joiner peer link never complete?
 //
@@ -1536,6 +1578,7 @@ void hjInstallPlayerBitGuard(void)
 void hjInstallPlayerBitGuard(void) { }
 void hjInstallAuxAcceptProbe(void) { }
 void hjFixMissingPads(void) { }
+void hjDumpDispatch(void) { }
 void hjAnnounce(void) { }
 void hjDumpRoster(void) { }
 void hjDumpNWPlayers(void) { }
