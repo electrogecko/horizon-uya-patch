@@ -779,6 +779,20 @@ void hjDumpDispatch(void)
         }
         HOTJOIN_LOG("cbref: %d hit(s)\n", hits);
     }
+
+    // The single cbref hit puts the delete callback's load at 0x00199a44.
+    // In the create invoker the lui sits at entry+4 (entry 0x001999b8, lui
+    // 0x001999bc), so the delete entry should be 0x00199a40 -- but "should
+    // be" is not good enough for a jalr target. Dump the whole function so
+    // the prologue is confirmed and, just as important, so we can see what
+    // it does with bCallbackCalled (nwp+0x1a6). Create SETS that flag; if
+    // delete does not CLEAR it, hjHostSpawnRemotes would instantly rebuild
+    // the player we just tore down.
+    p = (u32*)0x00199a30;
+    for (i = 0; i < 32; i += 4) {
+        HOTJOIN_LOG("delfn %08x: %08x %08x %08x %08x\n",
+            (u32)(p + i), p[i], p[i+1], p[i+2], p[i+3]);
+    }
 }
 
 // ---------------------------------------------------------------------------
