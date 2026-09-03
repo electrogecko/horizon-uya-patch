@@ -177,6 +177,12 @@ extern mapOverrideResponse;
 // whether this is the only broken structure or the first of many, and to log
 // idx so we can tell a legitimately-NULL object from a garbage table index.
 // ---------------------------------------------------------------------------
+// Armed by patchStaging (we are ENTERING a game), cleared once we are in one.
+// This is what lets the pad-table seed run during the menus=0/game=0 load window
+// without also running during the identical-looking window on the way OUT of a
+// game. Declared outside the NTSC block because patchStaging is common code.
+int hjSeedArmed = 0;
+
 #ifndef UYA_PAL
 #define HJ_PLAYERBIT_VTABLE_SLOT    (0x001dd970)
 #define HJ_PLAYERBIT_TABLE_BASE     (0x0022f550)
@@ -566,7 +572,13 @@ void hjFixMissingPads(void)
     // into structures the engine is tearing down in exactly that window.
     // Guarding only on isInMenus() let this run during teardown and crashed
     // both consoles on exit -- see the padhook note below.
-    if (isInMenus() || !isInGame())
+    if (isInMenus())
+        return;
+
+    // menus=0/game=0 covers BOTH the load into a game and the teardown out of
+    // one. Only the first is safe, and only the first is useful: the local
+    // player constructor runs inside it. hjSeedArmed tells them apart.
+    if (!isInGame() && !hjSeedArmed)
         return;
 
     for (i = 0; i < HJ_PAD_PTRS; ++i)
@@ -617,6 +629,10 @@ void hjFixMissingPads(void)
     // Remote players keep a NULL pPad for now. That re-admits their per-frame TLB misses,
     // which are noisy but non-fatal -- and correct input for the local player is worth
     // more than a quiet log until we know where per-player pads are really allocated.
+    if (!isInGame())
+        return;
+    hjSeedArmed = 0;
+
     {
         Player * p = playerGetFromSlot(0);
         if (p) {
@@ -675,56 +691,19 @@ void hjFixMissingPads(void)
                 }
             }
 
-            // Repairing pPad is not enough on its own. playerCreateLocalForSlot
-            // hangs the outgoing PadStream producer off the pad context:
-            //   525cb4  lw    $4,9524($18)    ; player->pPad  (+0x2534)
-            //   525cb8  addiu $3,$6,17768     ; 0x00534568, the producer
-            //   525cc8  sw    $3,1388($4)     ; *(pPad + 0x56C) = producer
-            //   525ccc  lw    $3,108($29)     ; player + 0x430C, its PadStream
-            //   525cd4  sw    $3,1392($2)     ; *(pPad + 0x570) = that stream
-            // and padPollControllerAndUpdate calls it:
-            //   488c80  lw $8,1388($16)   488c9c  lw $7,1392($16)   488ca8  jalr $8
+            // The padhook that used to live here is DELETED, not disabled.
             //
-            // On a hot-join pPad is NULL at that moment (the pad table at
-            // 0x002412F0 is still empty), so both stores fault -- we logged
-            // "TLB Miss, pc=0x525cb0 addr=0x56c [store]" and saw
-            // "padtable @002412f0: 00000000 ... (valid=0)". The producer is
-            // therefore never installed and never runs, which leaves the
-            // PadStream zeroed: curFrame stays 0 and padStreamReady stays 0.
+            // It wrote 0x00534568 -- Metropolis's producer -- into the pad
+            // struct. On Bakisi that address is different code, and the joiner
+            // executed it: "TLB Miss, pc=0x534568 addr=0x5053456b", then
+            // pc=0x0, then "Syscall: undefined (0)". A fallback that hardcodes
+            // a per-overlay address cannot be made safe; the seed above is the
+            // only correct fix, because it lets the constructor install its own
+            // overlay's producer.
             //
-            // That last value is the damage. compressedPoseCopyPayload only
-            // treats -1 as "nothing to send", so a ready of 0 returns 8 and the
-            // joiner sends a pad packet EVERY frame carrying no button data --
-            // 60/s against a consumer capped at 15/s. Measured: vanilla
-            // curFrame +60/s, seq +15/s, ready=-1; hot-join curFrame +0/s,
-            // seq +60/s, ready=0. That is both the ring overflow on the host
-            // and the "walks forward, cannot shoot" behaviour.
-            //
-            // So finish the constructor's job: install the two words it lost.
-            //
-            // FALLBACK ONLY as of the padseed above. Seeding table[0] before the
-            // constructor runs means the constructor installs the producer itself,
-            // using its own per-overlay address rather than our hardcoded one. If
-            // "padhook: FALLBACK FIRED" ever appears in a log, the seed landed too
-            // late and the hook point needs moving earlier -- do not just accept
-            // the repair, it reintroduces the per-map address problem.
-            // Fire ONLY when the slot is empty. The previous condition was
-            // "!= HJ_PADSTREAM_PRODUCER", i.e. "not Metropolis's producer, so
-            // force Metropolis's producer in" -- which stomps the correct
-            // producer on every other level. The pad struct at 0x00225900 is
-            // static and outlives a level, but 0x00534568 is a Metropolis
-            // OVERLAY address; once another overlay loads, that memory is
-            // different code and padPollControllerAndUpdate jalrs straight
-            // into it. No TLB miss, because the address is still mapped. That
-            // crashed host and joiner ~0.1s after the lobby's GuiMemoryMap on
-            // a normal quit-to-lobby.
-            if (*ppad && *(u32*)(*ppad + 0x56C) == 0) {
-                *(u32*)(*ppad + 0x56C) = HJ_PADSTREAM_PRODUCER;
-                *(u32*)(*ppad + 0x570) = (u32)p + HJ_PS_STREAM;
-                HOTJOIN_LOG("padhook: FALLBACK FIRED - pPad=%08x +0x56C=%08x +0x570=%08x (was ready=%d curFrame=%d)\n",
-                    *ppad, *(u32*)(*ppad + 0x56C), *(u32*)(*ppad + 0x570),
-                    *(int*)((u32)p + HJ_PS_READY), *(int*)((u32)p + HJ_PS_CURFRAME));
-            }
+            // padfill above stays: 0x00225900 is static and safe to point at.
+            // If it fires, the seed landed too late -- that is a diagnostic,
+            // and the joiner will move badly rather than crash.
         }
     }
 }
@@ -2000,6 +1979,13 @@ int patchStaging(UiMenu_t* ui, int pad)
     // so we can tell "staging never entered" apart from "logging not working".
     {
         static int hjEntry = 0;
+
+        // Reaching staging means we are on our way INTO a game, so the pad
+        // table may be seeded during the load window that follows. Cleared
+        // again by hjFixMissingPads once we are actually in the game, so the
+        // teardown window on the way out stays untouched.
+        hjSeedArmed = 1;
+
         if ((hjEntry % 30) == 0) {
             printf("HJ enter e=%d host=%d gs=%p cid=%d lobbyConn=%p\n",
                 hjEntry, gameAmIHost(), gs, clientId, netGetLobbyServerConnection());
