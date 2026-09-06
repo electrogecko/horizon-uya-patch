@@ -3056,6 +3056,13 @@ int main(void)
 	hjHostReapRemotes();
 	hjDumpPadStream();
 	hjDumpDispatch();
+	hjWatchStateMachine();
+	hjRestoreStateMachine();
+	hjInstallLeaveCallerProbe();
+	hjWatchLatch();
+	hjInstallErrorLatchProbe();
+	hjInstallLeaveActionProbe();
+	hjInstallBackoutProbe();
 	hjDumpPeers();
 	hjRefreshPeerActivity();
 	{

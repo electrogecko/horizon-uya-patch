@@ -317,6 +317,237 @@ void hjRegisterPlayerBit(void * a0, void * a1, int playerIndex)
 extern void internal_hjSendPeerConnectReq(int idx);   // 0x14ecd8
 
 
+// ---------------------------------------------------------------------------
+// Hotjoin: WHO WIPES THE PEER RECORD.
+//
+// Every failing join shows the same 2 s cycle on the host: three connect requests, an
+// introduce, msg22 type=3 (record -> state 3, f18=2), msg22 type=4 twice (record ->
+// state 4), and then, 15-170 ms later, the whole record reads back as zeroes with the
+// slot pointer unchanged. The successful join in the same log shows that cycle too --
+// it just got one cycle where the zeroing did NOT happen, and type=5 arrived 1.1 s
+// later. So this is a race that hot-join loses most of the time, not a hot-join-only
+// code path.
+//
+// Traced statically from the RAM image (ntsc.27.Lobby.bin, file offset == vaddr):
+//   0x14c658  peerReset(peers, idx): rec = peerLookup(peers, idx); memset(rec, 0, 40)
+//             -- 40 bytes is exactly the record size (0x14f960 allocates `li a0,40`),
+//                which is why our dump's f28 keeps its stale value: it is past the end.
+//   0x14cea8  peerClose(peers, idx): fires the disconnect callbacks, then peerReset.
+//             The ONLY caller of 0x14c658.
+// peerClose has exactly two call sites:
+//   0x14d0e0  inside the callback at 0x14d098 -- taken when its 4th argument is 0.
+//             The other branch bumps peers->0x438 and retransmits (0x14c390); our
+//             dumps show p438 stuck at 0, so this side never runs and the close side
+//             always does.
+//   0x150310  inside 0x150230(idx, reason) -- taken when 0 < reason < 3.
+// Both are plain `jal`s, so HOOK_JAL is safe and `ra` alone separates them.
+//
+// Budgeted and refilled per log epoch: this fires about once per 2 s, never per frame.
+#define HJ_PEERCLOSE_SITE_A (0x0014d0e0)
+#define HJ_PEERCLOSE_SITE_B (0x00150310)
+#define HJ_PEERCLOSE_CALL   (0x0c0533aa)   // jal 0x14cea8
+
+extern void internal_hjPeerClose(void * peers, int idx);   // 0x14cea8
+int hjCloseLogged = 0;
+int hjLeaveCallerLogged = 0;
+int hjLeaveSuppressed = 0;
+int hjLeavePending = 0;
+int hjLeaveConnectSeq = 0;
+int hjLeaveSkipDestroy = 0;
+int hjDestroyLogged = 0;
+int hjDestroySitesHooked = 0;
+
+// ---------------------------------------------------------------------------
+// The leave EPILOGUE at 0x001961D4, which runs whether or not we suppress the two
+// teardown calls before it:
+//
+//   1961d4  li   v1,5
+//   1961dc  sw   v1,0x120(s0)     state = 5
+//   1961f0  li   v0,-1
+//   1961f4  sw   v0,0x08(s0)      myClientIndex = -1
+//   1961fc  sw   zero,0x130(s0)
+//   196200  sw   v0,0x00(s0)
+//   196204  sw   zero,0x04(s0)    session pointer = NULL
+//   19620c  sw   zero,0x12c(s0)
+//
+// s0 is 0x001A5E50, and GAME_NET_INFO is 0x001A5E40 -- so +0x08 here IS
+// tNW_Info.myClientIndex (0x1A5E40 + 0x18). That is the `cid=-1` in our roster dump.
+//
+// Measured with both calls suppressed: peers survived (both records at 5), gs survived,
+// nwp[0] was rebuilt, the roster read n=2 states=8 8 -- and the joiner still sat in
+// menus forever, because the epilogue had wiped its client id and session pointer. The
+// objects were fine; the bookkeeping that names them was gone.
+//
+// So snapshot the fields the epilogue clobbers at suppression time and put them back on
+// the next tick. One frame of bad bookkeeping is survivable -- the client demonstrably
+// just sits there -- whereas losing it permanently is what blocks the join.
+#define HJ_SM_BASE      (0x001A5E50)
+#define HJ_SM_F00       (0x00)
+#define HJ_SM_SESSION   (0x04)
+#define HJ_SM_CLIENTID  (0x08)
+#define HJ_SM_STATE     (0x120)
+#define HJ_SM_F12C      (0x12c)
+#define HJ_SM_F130      (0x130)
+#define HJ_SM_LEAVENOW  (0x001A5FC0)   // +0x170: 1 = leave on THIS pass, no async queue
+
+int hjSmRestorePending = 0;
+int hjSmRestoreLogged = 0;
+u32 hjSmSaved[6];
+int hjLeaveReqState = 7;   // 7 = established session; what leavecall reports every time
+int hjSmWatchLast = -1;
+int hjSmWatchLogged = 0;
+int hjCcLogged = 0;
+int hjCcInstalled = 0;
+int hjLeaveActLogged = 0;
+int hjLeaveActHooked = 0;
+int hjBackoutLogged = 0;
+int hjBackoutHooked = 0;
+int hjCbLogged = 0;
+int hjRt12Logged = 0;
+int hjRt12Installed = 0;
+#define HJ_RT12_DEFER_MAX (240)   // ~4 min of 1 Hz retries; the loop times out long before
+int hjRt12Defer = 0;
+u32 hjRt12Orig = 0;
+int hjEvLogged = 0;
+int hjEvDropped = 0;
+int hjLatchLogged = 0;
+u32 hjLatchSeen[4] = {0,0,0,0};
+int hjLatchWatchLogged = 0;
+
+static void hjSnapshotStateMachine(void)
+{
+    hjSmSaved[0] = *(u32*)(HJ_SM_BASE + HJ_SM_F00);
+    hjSmSaved[1] = *(u32*)(HJ_SM_BASE + HJ_SM_SESSION);
+    hjSmSaved[2] = *(u32*)(HJ_SM_BASE + HJ_SM_CLIENTID);
+    hjSmSaved[3] = *(u32*)(HJ_SM_BASE + HJ_SM_STATE);
+    hjSmSaved[4] = *(u32*)(HJ_SM_BASE + HJ_SM_F12C);
+    hjSmSaved[5] = *(u32*)(HJ_SM_BASE + HJ_SM_F130);
+    hjSmRestorePending = 1;
+}
+
+// Every transition of the session manager's state, edge-triggered. This is the thing
+// we have been inferring from side effects; now it is just printed. Cheap: one load
+// per frame, one log line per transition.
+void hjWatchStateMachine(void)
+{
+    int now = *(int*)(HJ_SM_BASE + HJ_SM_STATE);
+    if (now == hjSmWatchLast)
+        return;
+    if (hjSmWatchLogged < 64) {
+        ++hjSmWatchLogged;
+        HOTJOIN_LOG("sm: state %d -> %d  cid=%d session=%08x flag=%d menus=%d game=%d gs=%p\n",
+            hjSmWatchLast, now,
+            *(int*)(HJ_SM_BASE + HJ_SM_CLIENTID),
+            *(u32*)(HJ_SM_BASE + HJ_SM_SESSION),
+            *(int*)0x001A5FC0,
+            isInMenus(), isInGame(), gameGetSettings());
+    }
+    hjSmWatchLast = now;
+}
+
+void hjRestoreStateMachine(void)
+{
+    u32 nowState, nowSession;
+
+    if (1 || !hjSmRestorePending)   // DISABLED (section 48)
+        return;
+    hjSmRestorePending = 0;
+
+    nowState   = *(u32*)(HJ_SM_BASE + HJ_SM_STATE);
+    nowSession = *(u32*)(HJ_SM_BASE + HJ_SM_SESSION);
+
+    // Only act if the epilogue actually ran. If it did not, the saved values are the
+    // live ones and writing them back is a no-op we would rather not perform.
+    if (nowSession != 0 || nowState != 5)
+        return;
+
+    {
+        // The state to unwind to is the one from BEFORE the leave was requested. If that
+        // itself reads as a leave-in-progress value (9/10/11), something is off and 7
+        // (established) is the only sane target.
+        int target = (hjLeaveReqState >= 1 && hjLeaveReqState <= 8) ? hjLeaveReqState : 7;
+
+        *(u32*)(HJ_SM_BASE + HJ_SM_F00)      = hjSmSaved[0];
+        *(u32*)(HJ_SM_BASE + HJ_SM_SESSION)  = hjSmSaved[1];
+        *(u32*)(HJ_SM_BASE + HJ_SM_CLIENTID) = hjSmSaved[2];
+        *(u32*)(HJ_SM_BASE + HJ_SM_STATE)    = (u32)target;
+        *(u32*)(HJ_SM_BASE + HJ_SM_F12C)     = hjSmSaved[4];
+        *(u32*)(HJ_SM_BASE + HJ_SM_F130)     = hjSmSaved[5];
+
+        if (hjSmRestoreLogged < 8) {
+            ++hjSmRestoreLogged;
+            HOTJOIN_LOG("smrestore: state 5 -> %d (snapshot had %d, request had %d), cid -1 -> %d, session 0 -> %08x\n",
+                target, (int)hjSmSaved[3], hjLeaveReqState, (int)hjSmSaved[2], hjSmSaved[1]);
+        }
+    }
+}
+int hjLeaveSitesHooked = 0;
+u32 hjLeaveOrig = 0;
+int hjLeaveLogged = 0;
+int hjCloseSuppressed = 0;
+// Declared here, not next to hjSessionEndHook: hjLogEpochTock refills the budget and
+// lives earlier in the file.
+u32 hjSessEndOrig = 0;
+int hjSessEndLogged = 0;
+
+// Cap the protection so a peer that really is gone is eventually released. ~40 closes
+// is about 80 s of the 2 s retry cycle -- far longer than any join needs, short enough
+// that a dead slot does not survive the whole match. Rearmed in menus by hjAnnounce.
+#define HJ_CLOSE_SUPPRESS_MAX (40)
+
+// a2/a3 are still live at the 0x14d0e0 call site: 0x14d098 only copies a0 into t0 and
+// branches on a2/a3 before it gets here, so nothing has clobbered them. a3 is 0 by the
+// branch condition; a2 is the one unknown worth reading.
+void hjPeerCloseHook(void * peers, int idx, int a2, int a3)
+{
+    u32 ra = (u32)__builtin_return_address(0);
+    void * pp = (peers && idx >= 0 && idx < 8)
+              ? internal_hjPeerLookup(peers, idx) : 0;
+    int t08 = pp ? *(int*)((u32)pp + 0x08) : -1;
+
+    // The close is what loses us the join. Measured on the host: the joiner's record
+    // reaches state 4, and this fires 15-170 ms later and memsets it, while the type-5
+    // that would finish the handshake does not arrive until ~1.1 s after state 4. So
+    // the record has to survive the handshake window or the join cannot complete.
+    //
+    // Suppress ONLY mid-handshake (states 1..4), only on the host, only in-game. An
+    // ESTABLISHED peer at state 5 still closes normally -- that path is correct and is
+    // what feeds the reaper when a player quits (observed: close at t08=5, reap 0.9 s
+    // later). This does not explain WHY the close fires; it stops it eating the
+    // handshake while that is still open.
+    // DISABLED (section 49). This was guarding against the 2 s wipe cycle of section 33,
+    // which turned out to be the joiner LEAVING (its own retry loop) and the host closing
+    // the departed peer correctly. Suppressing it left the host holding a dead record at
+    // state 2, so on the joiner's next attempt the host never re-introduced it and the
+    // joiner saw peers[0]=NULL immediately. Log only.
+    if (0 && gameAmIHost() && isInGame() && !isInMenus()
+        && t08 >= 1 && t08 <= 4
+        && hjCloseSuppressed < HJ_CLOSE_SUPPRESS_MAX) {
+        ++hjCloseSuppressed;
+        if (hjCloseLogged < 24) {
+            ++hjCloseLogged;
+            HOTJOIN_LOG("peerclose: SUPPRESSED idx=%d ra=%08x t08=%d f18=%d a2=%08x a3=%08x n=%d\n",
+                idx, ra, t08,
+                pp ? *(int*)((u32)pp + 0x18) : -1,
+                (u32)a2, (u32)a3, hjCloseSuppressed);
+        }
+        return;
+    }
+
+    if (hjCloseLogged < 24) {
+        ++hjCloseLogged;
+        HOTJOIN_LOG("peerclose: idx=%d ra=%08x rec=%08x t08=%d f18=%d f1C=%d p438=%d p408=%d a2=%08x a3=%08x\n",
+            idx, ra, (u32)pp, t08,
+            pp ? *(int*)((u32)pp + 0x18) : -1,
+            pp ? *(int*)((u32)pp + 0x1C) : -1,
+            peers ? *(int*)((u32)peers + 0x438) : -1,
+            peers ? *(int*)((u32)peers + 0x408) : -1,
+            (u32)a2, (u32)a3);
+    }
+
+    internal_hjPeerClose(peers, idx);
+}
+
 void hjPeerConnectReqHook(int idx)
 {
     u32 ra = (u32)__builtin_return_address(0);
@@ -412,8 +643,9 @@ int hjConnectHook(void * params, u32 * out)
     u32 * p = (u32*)params;
     int n = ++hjConnectCalls;
 
-    HOTJOIN_LOG("connect[%d] IN params=%08x out=%08x busy=%08x ctx=%08x\n",
-        n, (u32)params, (u32)out, busy, *(u32*)HJ_NET_CTX_PTR);
+    HOTJOIN_LOG("connect[%d] IN params=%08x out=%08x busy=%08x ctx=%08x sm=%d stk=%08x/%08x/%08x/%08x\n",
+        n, (u32)params, (u32)out, busy, *(u32*)HJ_NET_CTX_PTR, *(int*)0x001A5F70,
+        *(u32*)0x001CF760, *(u32*)0x001CF764, *(u32*)0x001CF768, *(u32*)0x001CF76C);
     if (p)
         HOTJOIN_LOG("connect[%d] p0=%08x p4=%08x p8=%08x pC=%08x p14=%08x p18=%08x\n",
             n, p[0], p[1], p[2], p[3], p[5], p[6]);
@@ -854,21 +1086,58 @@ static int hjAnnounceTick = 0;
 // been over for nearly a minute and the host had nothing live to match. Announce at 1 Hz
 // for as long as the join is in progress instead, so the window spans the load and, more
 // importantly, continues after spawn.
-#define HJ_ANNOUNCE_MAX_SENDS   (240)  // ~4 min at 1 Hz; a cap, not an expected count
-#define HJ_ANNOUNCE_PERIOD      (60)   // frames between resends (~1 s at 60 Hz)
+#define HJ_ANNOUNCE_MAX_SENDS   (240)  // a cap, not an expected count
+#define HJ_ANNOUNCE_PERIOD      (60)   // frames between resends once the burst is spent
+// The host's record for the joiner is closed (memset to 0 by peerClose, see FINDINGS
+// s33) 15-170 ms after it reaches state 4. Our type-5 announce is what drives that
+// record to 5, and at a flat 1 Hz it lands inside that window roughly one time in six
+// -- which is exactly the observed join rate. In the one join that worked, the host's
+// record happened to survive a full 1.09 s (one announce period) and the very next
+// announce completed it. So burst first, then settle: the burst is what wins the race,
+// the 1 Hz tail is what covers a host that is slow to arrive.
+#define HJ_ANNOUNCE_BURST_SENDS (20)   // sends issued at the fast rate
+#define HJ_ANNOUNCE_BURST_PERIOD (6)   // frames between them (~10 Hz, ~2 s of burst)
+
+static int hjAnnounceWasInMenus = 0;
+#define HJ_PROMOTE_STALL (90)   // 1.5 s: the game's own 3 -> 5 lands at ~0.2 s
+int hjPromoteStall = 0;
+extern int internal_hjPublishMyIndex(void * peers, int idx);   // 0x171d18
+// 0x171d30 -- the completion gate. It has NO static callers: its address lives at
+// ctx+0x8C (0x001D88AC) and the net layer invokes it when a peer event arrives. So
+// satisfying its gates is not enough on a stalled rejoin; nothing re-evaluates them
+// until another peer message shows up, and none does. The promote below calls it
+// directly, exactly as the net layer would. It takes no arguments and reads only
+// globals (ctx->0xE8, netctx->0x10C, peers->0x400/0x404).
+extern int internal_hjCheckAllConnected(void);   // 0x171d30
 
 void hjAnnounce(void)
 {
     u32 ctx = *(u32*)HJ_NET_CTX_PTR;
     u32 peers, mine;
 
-    if (isInMenus()) {
-        // Rearm for the next join attempt, so a retry is a clean run rather than
-        // inheriting a spent send budget from the attempt that failed.
-        hjAnnounceDone = 0;
-        hjAnnounceSends = 0;
-        hjAnnounceTick = 0;
-        return;
+    {
+        int inMenus = isInMenus();
+
+        // Rearm on the EDGE into menus, so a retry is a clean run rather than inheriting
+        // a spent budget -- but do NOT return while in menus. Measured: the joiner's own
+        // record reached state 4 at client 745.3047 with menus=1, and the old level-
+        // triggered gate meant hjAnnounce refused to promote it; the joiner then tore
+        // down 0.03 s later having never announced. Staging IS when the announce has to
+        // happen for a hot-join.
+        if (inMenus && !hjAnnounceWasInMenus) {
+            hjAnnounceDone = 0;
+            hjAnnounceSends = 0;
+            hjAnnounceTick = 0;
+            hjCloseSuppressed = 0;
+            hjLeaveSuppressed = 0;
+        }
+        hjAnnounceWasInMenus = inMenus;
+
+        // Only announce from menus when this is actually a hot-join: the server clamps
+        // an in-game host to GAME_START (7) in the roster it injects, whereas an ordinary
+        // staging join sits at READY (6) until the match starts. Without this a vanilla
+        // staging join would start forcing its own record to 5 mid-staging, which is a
+        // behaviour change we have no evidence is safe.
     }
 
     if (!ctx)
@@ -879,6 +1148,61 @@ void hjAnnounce(void)
     mine = *(u32*)(peers + 0x400);
     if (!mine)
         return;
+
+    // The connect completion at ctx+0xF0 is gated by 0x00171D30, and gate B is
+    //     v0 = myRec->0x08 - 4;  if ((unsigned)v0 >= 2) return;
+    // i.e. MY OWN record must read 4 or 5 or the completion never fires -- the manager
+    // stays at state 9 and the joiner spins forever. Measured across a working join and
+    // a stuck rejoin on the same boot:
+    //     success  mine08 3 -> 3 -> 5 at +180 ms, completion 70 ms later
+    //     stuck    mine08 3 -> 3 -> 3 ... forever, no completion, no gs
+    // The game's own 3 -> 5 transition is 0x0016FA78 (`li v0,5; sw v0,8(s0)`, then
+    // 0x18 = 1 and 0x171D18 to publish the index), taken only when it has no outstanding
+    // type-21 sends AND peers->0x438 == 0. On the rejoin it has an outstanding send, so
+    // it never runs -- which is section 35's `0x0016FA68` ordering condition, seen from
+    // the other side.
+    //
+    // So accept 3 as well as 4, but only after the peer layer has had its chance: the
+    // manager still at 9 (completion pending), 0x438 clear, and stalled for
+    // HJ_PROMOTE_STALL frames. On the fast path the game gets there first and this never
+    // fires.
+    // Deliberately NOT gated on gs: on a stuck rejoin gs is NULL for the entire stall,
+    // because gs only appears once the completion has run. The discriminator is the
+    // stall itself -- manager parked at 9 with the completion pending and my own record
+    // still at 3 -- which no healthy join of either kind sits in for 1.5 s.
+    if (!gameAmIHost() && *(u32*)(peers + 0x438) == 0
+        && *(int*)(mine + 0x08) == 3
+        && *(int*)(HJ_SM_BASE + HJ_SM_STATE) == 9) {
+        if (++hjPromoteStall == HJ_PROMOTE_STALL) {
+            void * p0 = internal_hjPeerLookup((void*)peers, 0);
+            *(int*)(mine + 0x08) = 5;
+            *(int*)(mine + 0x18) = 1;
+            internal_hjPublishMyIndex((void*)peers, *(int*)(peers + 0x404));
+            {
+                u32 nctx = *(u32*)HJ_NET_CTX_PTR;
+                int gateA = nctx ? *(int*)(nctx + 0x10C) : -1;
+                int r = internal_hjCheckAllConnected();
+                HOTJOIN_LOG("promote: myRec %08x 3 -> 5 after %d frames; idx %d; p0 t08=%d f1C=%d p408=%d p43C=%d gateA=%d check=%d sm=%d gs=%p\n",
+                    mine, HJ_PROMOTE_STALL, *(int*)(peers + 0x404),
+                    p0 ? *(int*)((u32)p0 + 0x08) : -1, p0 ? *(int*)((u32)p0 + 0x1C) : -1,
+                    *(int*)(peers + 0x408), *(int*)(peers + 0x43C), gateA, r,
+                    *(int*)(HJ_SM_BASE + HJ_SM_STATE), gameGetSettings());
+            }
+        }
+    } else {
+        hjPromoteStall = 0;
+    }
+
+    // The hot-join gate for the ANNOUNCE only. It cannot cover the promote above: the
+    // stall happens before gs exists (`gs=0x0` for the whole stuck rejoin), which is
+    // exactly why the first version of the promote never fired -- it sat behind this
+    // very return. The server clamps an in-game host to GAME_START (7) in the roster it
+    // injects, so a vanilla staging join (host at READY 6) still never announces.
+    if (isInMenus()) {
+        GameSettings * ags = gameGetSettings();
+        if (!ags || ags->PlayerStates[0] < 7)
+            return;
+    }
 
     if (*(u32*)(peers + 0x438) == 0 && *(int*)(mine + 0x08) == 4) {
         *(int*)(mine + 0x08) = 5;
@@ -895,9 +1219,15 @@ void hjAnnounce(void)
     // Retransmit: these are UDP datagrams and this protocol demonstrably depends on
     // repetition (the game's own peer-connect request retries every ~3 s). Space them
     // out rather than firing the whole budget in consecutive frames.
-    if (*(int*)(mine + 0x08) == 5 && hjAnnounceSends < HJ_ANNOUNCE_MAX_SENDS) {
+    // Only the machine that PERFORMED the 4 -> 5 promotion announces. The host's own
+    // record already sits at 5 from the moment it opens the game, so without this gate
+    // the host also ran the send loop -- 240 unsolicited type-5 broadcasts per game,
+    // from a machine that has nothing to announce. That is traffic vanilla never emits.
+    if (hjAnnounceDone && *(int*)(mine + 0x08) == 5
+        && hjAnnounceSends < HJ_ANNOUNCE_MAX_SENDS) {
         if (--hjAnnounceTick <= 0) {
-            hjAnnounceTick = HJ_ANNOUNCE_PERIOD;
+            hjAnnounceTick = (hjAnnounceSends < HJ_ANNOUNCE_BURST_SENDS)
+                           ? HJ_ANNOUNCE_BURST_PERIOD : HJ_ANNOUNCE_PERIOD;
             ++hjAnnounceSends;
             internal_hjSendPeerMsg((void*)peers, -1);
             // 1 Hz for minutes would flood the console; log the early ones (the load
@@ -977,6 +1307,10 @@ static int hjRosterBeat = 0;
 // still no player" is a real possible outcome, and would point at the in-game
 // waiting-for-players / readiness gate as the place the actual admit-player work lives.
 // ---------------------------------------------------------------------------
+// One bit per slot: "we have already called the spawn invoker for this player".
+// Cleared on the menus edge -- and, since section 63, by the reaper, because an in-game
+// host NEVER returns to menus. A stale bit here silently disables every repair below it.
+int hjSpawned = 0;
 int hjAdopted = 0;                 // bitmask of slots we have already written
 
 void hjHostAdoptPeers(void)
@@ -1217,6 +1551,12 @@ void hjHostReapRemotes(void)
         // rearmed in menus, and an in-game host never goes there.
         if (gs && cid >= 0 && cid < GAME_MAX_PLAYERS) {
             int k, n = 0;
+            // Release our own per-slot latch too. Without this the slot is reaped and
+            // re-adopted correctly but hjHostSpawnRemotes still skips it forever on
+            // `hjSpawned & (1 << i)`, so the rejoining player is never reconstructed --
+            // measured as reap -> adopt -> nothing, with plist[1] NULL for the rest of
+            // the match.
+            hjSpawned &= ~(1 << cid);
             gs->PlayerClients[cid] = -1;
             gs->PlayerStates[cid]  = 0;
             gs->PlayerTeams[cid]   = -1;
@@ -1320,11 +1660,11 @@ extern void internal_hjSpawnRemotePlayer(void * nwPlayer);
 // still clear. 0x1999b8 sets that flag itself, so this cannot fire twice for a
 // slot -- but keep an explicit mask too, since a constructor of 2352 instructions
 // run twice on one record is not something to leave to one flag.
-static int hjSpawned = 0;
 
 void hjHostSpawnRemotes(void)
 {
     Player ** all;
+    GameSettings * gs;
     int i, me;
 
     if (isInMenus()) { hjSpawned = 0; return; }
@@ -1335,12 +1675,35 @@ void hjHostSpawnRemotes(void)
     if (!all)
         return;
 
+    gs = gameGetSettings();
     me = gameGetMyClientId();
     for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
         u32 nwp = HJ_NWPLAYER_BASE + (i * HJ_NWPLAYER_STRIDE);
         if (i == me)                       continue;   // never the local player
         if (hjSpawned & (1 << i))          continue;
         if (all[i])                        continue;   // already has a Player
+
+        // REJOIN REPAIR. The delete invoker 0x199A40 clears netClientIndex to -1 but
+        // deliberately leaves pNetPlayerData (+0x04) intact, so after a reap the slot
+        // reads cid=-1 with pData still populated. On a reconnect the engine does not
+        // put the index back -- measured with the joiner re-broadcasting its 00-04 on
+        // every connect and the host still showing
+        //     nwp[1] cid=-1 pData=01f7c1f0 spawned=0  seq=186 rcvFrame=5532 thr=2
+        // i.e. the joiner's pad data arriving and being buffered into a slot whose
+        // identity is missing, with plist[1] NULL and the host unable to see the player.
+        //
+        // The roster is the authority here and it is already correct (clients=0 1,
+        // written by hjHostAdoptPeers from a peer at state 5). So when the roster claims
+        // this slot and the data pointer is live, put the index back and let the vanilla
+        // invoker below do the real work. This is the same shape as the roster adopt,
+        // one level down.
+        if (*(int*)(nwp + 0x00) < 0 && *(u32*)(nwp + 0x04) != 0
+            && gs && gs->PlayerClients[i] == i) {
+            *(int*)(nwp + 0x00) = i;
+            HOTJOIN_LOG("respawn: nwp[%d] cid -1 -> %d from roster (pData=%08x)\n",
+                i, i, *(u32*)(nwp + 0x04));
+        }
+
         if (*(int*)(nwp + 0x00) < 0)       continue;   // no client in this slot
         if (*(short*)(nwp + 0x1a6) != 0)   continue;   // callback already ran
         if (*(u32*)(nwp + 0x04) == 0)      continue;   // no tNW_PlayerData
@@ -1399,6 +1762,8 @@ void hjDumpRoster(void)
         gs->PlayerTypes[4], gs->PlayerTypes[5], gs->PlayerTypes[6], gs->PlayerTypes[7]);
 }
 
+static int hjPeerWasInMenus = 0;
+
 void hjDumpPeers(void)
 {
     u32 ctx = *(u32*)HJ_NET_CTX_PTR;
@@ -1421,9 +1786,18 @@ void hjDumpPeers(void)
     // 40, which was entirely consumed by ~17 failed connect attempts in the menu -- so
     // the log went silent exactly when the joiner finally got in-game, which is the only
     // moment that matters. Reset the budget on each menus->in-game transition.
-    if (isInMenus()) {
-        hjPeerDumps = 0;
-        hjLastPeerSig = 0;
+    // EDGE-triggered, not level-triggered. Resetting hjLastPeerSig on every menus frame
+    // defeated the dedup entirely for the joiner, which spends the whole join in menus:
+    // one 13-second client capture came back with 6592 identical peer dumps and no room
+    // for anything else. Per probe-perturbs-timing, that is not just noise -- it is a
+    // per-frame cost on the machine whose timing we are measuring.
+    {
+        int inMenus = isInMenus();
+        if (inMenus && !hjPeerWasInMenus) {
+            hjPeerDumps = 0;
+            hjLastPeerSig = 0;
+        }
+        hjPeerWasInMenus = inMenus;
     }
     if (sig == hjLastPeerSig || hjPeerDumps > 60)
         return;
@@ -1580,6 +1954,21 @@ void hjLogEpochTock(void)
     hjLastRosterSig = 0;
     hjNwDumps = 0;
     hjLastNwSig = 0;
+    hjCloseLogged = 0;
+    hjSessEndLogged = 0;
+    hjLeaveLogged = 0;
+    hjLeaveCallerLogged = 0;
+    hjDestroyLogged = 0;
+    hjSmRestoreLogged = 0;
+    hjSmWatchLogged = 0;
+    hjCcLogged = 0;
+    hjLeaveActLogged = 0;
+    hjBackoutLogged = 0;
+    hjCbLogged = 0;
+    hjRt12Logged = 0;
+    hjEvLogged = 0;
+    hjLatchLogged = 0;
+    hjLatchWatchLogged = 0;
     // The player-array dump had the same one-shot cap as the others, and it cost us a
     // measurement: on the host it fired ONCE at 217.7s, six seconds BEFORE the roster
     // adopt at 223.98s, so the run that finally produced a matching roster on both
@@ -1646,6 +2035,7 @@ void hjInstallType22Probe(void)
     *slot = (u32)&hjType22Hook;
     hjT22Installed = 1;
     HOTJOIN_LOG("msg22: probe installed, slot22 @%08x\n", (u32)slot);
+    hjInstallRt12Probe();
 }
 
 // ---------------------------------------------------------------------------
@@ -1695,6 +2085,855 @@ int hjMarkConnectedHook(void * peers, int peerIdx, void * out)
     return ret;
 }
 
+// ---------------------------------------------------------------------------
+// Hotjoin: WHO TEARS THE JOINER DOWN.
+//
+// The joiner now reaches a state where everything looks right -- peers[0] and its own
+// record both at 5, roster clients=0 1, states=7 0, nwp[0] created with cid=0 -- and
+// then abandons the whole join ~30 ms later (nwp[0] cid 0 -> -1, then gs=0x0).
+//
+// The teardown runs through a sweep at 0x199d28: for each of the 8 tNW_Player slots
+// (0x22F550, stride 0xC70) it checks `slot->0x1a4`, and if set decrements a gp-relative
+// counter and calls the delete invoker at 0x199a40. The only thing that sets 0x1a4 is
+// the routine at 0x199cb8: it resolves the session context via 0x16ed00, takes ctx->0x1C,
+// reads sessionObj->0x54 as the slot index, and marks that slot. 0x199cb8 is not called
+// by anything -- it is a callback, and the pointer lives at 0x001dd9b0.
+//
+// So swapping that pointer gives us the one thing we cannot infer: the return address of
+// whatever in the netplay layer decided the host's session had ended. Fires at most once
+// per attempt, off the hot path.
+#define HJ_SESSEND_SLOT (0x001dd9b0)
+#define HJ_SESSEND_ORIG (0x00199cb8)
+
+void hjSessionEndHook(int idx, int msgId)
+{
+    u32 ra = (u32)__builtin_return_address(0);
+    void (*orig)(int, int) = (void (*)(int, int))hjSessEndOrig;
+    int i, marked = -1;
+
+    orig(idx, msgId);
+
+    // 0x199cb8 sets slot->0x1a4; the sweep clears it. Read it back before the sweep runs
+    // to name the slot that was just condemned.
+    for (i = 0; i < HJ_NWP_SLOTS; ++i) {
+        u32 nwp = HJ_NWPLAYER_BASE + (i * HJ_NWPLAYER_STRIDE);
+        if (*(short*)(nwp + 0x1a4) != 0) { marked = i; break; }
+    }
+
+    if (hjSessEndLogged < 8) {
+        ++hjSessEndLogged;
+        HOTJOIN_LOG("sessend: ra=%08x idx=%d msg=%d marked=%d menus=%d game=%d host=%d\n",
+            ra, idx, msgId, marked, isInMenus(), isInGame(), gameAmIHost());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hotjoin: WHO LEAVES THE SESSION.
+//
+// The sessend probe answered the previous question: ra=0016f360, which is the tail of
+// 0x16f308 -- a two-argument dispatch through a table at 0x001dd9b0 indexed by a byte
+// out of the message descriptor (0x16f020 maps a message id < 4096 to its descriptor).
+// So 0x199cb8 is not a standalone callback, it is handler 0 of the MESSAGE-RETIRED
+// table, and 0x199c40 (registerPlayerBit) is handler 0 of the parallel MESSAGE-RECEIVED
+// table at 0x001dd970. Retiring that message deletes the player it created.
+//
+// Following it up: 0x16f378(msgId) retires one message and is called from five sites,
+// one of which (0x16f734) is a loop over all 4096 message slots -- a bulk flush --
+// reached only from 0x171f48. That call sits inside 0x171ee8, which broadcasts internal
+// message 18 to every peer, flushes every message, then clears ctx->0xE8 (the peers
+// pointer) and ctx->0x108/0x10C. That is LEAVE SESSION, and it explains everything the
+// joiner does: its tNW_Players are deleted, gs goes NULL, and hjDumpPeers falls silent
+// until the next connect because ctx->0xE8 is zero.
+//
+// 0x171ee8 lives at ctx+0x1C (0x001d883c), so one pointer swap names the caller that
+// decided to leave. Nothing here is per-frame: it fires once per attempt.
+#define HJ_LEAVE_SLOT (0x001d883c)
+#define HJ_LEAVE_ORIG (0x00171ee8)
+
+// The leave is ASYNCHRONOUS and it lands too late. Measured on the joiner:
+//
+//   967.8138  leavecall ra=006d0ee8 state=7 flag=0   <- leave REQUESTED (pre-join teardown)
+//   967.8167  connect[1]                             <- new session starts 3 ms later
+//   968.0353  roster clients=0 1                     <- new session healthy
+//   968.0360  nwp[0] cid=0 spawned=1
+//   968.0369  leave: ctx->0x1C fires                 <- the leave COMPLETES, 220 ms late
+//   968.0468  nwp[0] cid=-1                          <- and takes the new session with it
+//
+// 0x195900 with flag == 0 does not leave immediately: it sends peer message 42, sets
+// state 9, and registers 0x196088 as the completion callback (its address is written to
+// sp+0x20 at 0x1959e4 for the 0x14b448 call -- which is why 0x196088 has no static
+// callers anywhere in RAM). When that completes it sets state 10, and the next tick of
+// 0x196128 runs the real leave. By then the joiner has connected, been given a roster,
+// and built the host's tNW_Player. 0x171ee8 clears ctx->0xE8, so the peers block it
+// destroys is the NEW one -- which is also why the next attempt finds peers[0] == NULL
+// and p438 == 1 and spins forever.
+//
+// Suppress the leave when a live game object already exists on the joiner. Host-side and
+// out-of-menus leaves are untouched, and the budget is rearmed in menus.
+#define HJ_LEAVE_SUPPRESS_MAX (4)
+
+int hjLeaveSessionHook(void * peers)
+{
+    u32 ra = (u32)__builtin_return_address(0);
+    int (*orig)(void *) = (int (*)(void *))hjLeaveOrig;
+    u32 ctx = *(u32*)HJ_NET_CTX_PTR;
+    u32 live = ctx ? *(u32*)(ctx + HJ_CTX_PEERS) : 0;
+
+    // Suppress ONLY a leave that has been overtaken by a new connect. hjNetLeaveGameHook
+    // snapshots hjConnectCalls when the leave is REQUESTED; if a connect has happened
+    // between the request and this completion, the session being torn down is not the one
+    // the request was about, and running it would destroy the new one.
+    //
+    // The first version of this gated on `peers == ctx->0xE8` and on not being the host,
+    // and that broke CREATING a game: the pre-create teardown has no connect after it, is
+    // entirely legitimate, and matched the condition anyway -- so the old DME session was
+    // never released and the next create bounced straight back out (Medius showed
+    // CreateGameResponse MediusSuccess immediately followed by LeftGameWorld). A leave
+    // with no intervening connect must always be allowed through.
+    GameSettings * lgs = gameGetSettings();
+    int stale = hjLeavePending && (hjConnectCalls != hjLeaveConnectSeq);
+    hjLeavePending = 0;
+
+    // Belt and braces after the create-a-game regression: also require the hot-join
+    // signature -- we are not the host, and the roster we are looking at has its host
+    // already at GAME_START (7) or beyond. A game you just created has neither.
+    // DISABLED (section 48): the teardown is the probe completing by design. Kept as a
+    // log line only; `stale` is still computed so the trace shows the ordering.
+    if (0 && stale && !isInGame() && !gameAmIHost()
+        && lgs && lgs->PlayerStates[0] >= 7
+        && hjLeaveSuppressed < HJ_LEAVE_SUPPRESS_MAX) {
+        ++hjLeaveSuppressed;
+        // Arm the destructor skip. 0x1961c4 makes TWO calls, and suppressing only the
+        // first is worse than suppressing neither -- see hjPeersDestroyHook.
+        hjLeaveSkipDestroy = 1;
+        hjSnapshotStateMachine();
+        if (hjLeaveLogged < 8) {
+            ++hjLeaveLogged;
+            HOTJOIN_LOG("leave: SUPPRESSED (stale) ra=%08x peers=%08x live=%08x conn %d->%d gs=%p n=%d\n",
+                ra, (u32)peers, live, hjLeaveConnectSeq, hjConnectCalls,
+                (void*)lgs, hjLeaveSuppressed);
+        }
+        return 0;
+    }
+
+    hjLeaveSkipDestroy = 0;
+
+    if (hjLeaveLogged < 8) {
+        ++hjLeaveLogged;
+        HOTJOIN_LOG("leave: ra=%08x peers=%08x live=%08x conn %d->%d stale=%d menus=%d game=%d host=%d gs=%p\n",
+            ra, (u32)peers, live, hjLeaveConnectSeq, hjConnectCalls, stale,
+            isInMenus(), isInGame(), gameAmIHost(), (void*)lgs);
+    }
+
+    return orig(peers);
+}
+
+// ---------------------------------------------------------------------------
+// Hotjoin: WHICH menu path asks to leave.
+//
+// Traced from the leave downward, all in the base exe:
+//   0x171ee8  ctx+0x1C   broadcast internal msg 18, flush all messages, ctx->0xE8 = 0
+//   0x14b1b8             the locked wrapper around it; sole caller 0x1961c4
+//   0x1961c4             inside a state machine on the struct at 0x001A5E50:
+//                        state (+0x120, i.e. 0x001A5F70) == 10 -> leave, then state 5
+//   0x195900             the entry point: if state >= 10 return; else if +0x170
+//                        (0x001A5FC0) == 1 -> state 10 (leave NOW); else send peer
+//                        message 42 via (*(0x1a1ce8))->0x28 = 0x1746e8, which itself
+//                        sets +0x170 = 1, and go to state 9 (leave next pass).
+//
+// 0x195900 has exactly four callers and every one of them is in the MENU/STAGING
+// overlay: 0x6aa2dc, 0x6adc54, 0x6d0ee0, 0x6d15b0. Two of them (0x6aa2b0, 0x6adc20)
+// pre-set +0x170 = 1 so the leave happens on the first pass -- which matches the ~2
+// frames we measured. So the joiner is not being disconnected; the staging screen is
+// asking to leave.
+//
+// These are OVERLAY addresses, so: verify each site still reads `jal 0x195900` before
+// writing, install only while in menus (when that module is certainly resident), and
+// allow reinstallation if the module is reloaded. If the overlay is replaced our four
+// words go with it, which is harmless -- the hook body lives in patch RAM.
+#define HJ_LEAVE_CALL     (0x0c065640)   // jal 0x195900
+#define HJ_LEAVE_SITE_A   (0x006aa2dc)
+#define HJ_LEAVE_SITE_B   (0x006adc54)
+#define HJ_LEAVE_SITE_C   (0x006d0ee0)
+#define HJ_LEAVE_SITE_D   (0x006d15b0)
+
+extern int internal_hjNetLeaveGame(void);   // 0x195900
+
+int hjNetLeaveGameHook(void)
+{
+    u32 ra = (u32)__builtin_return_address(0);
+
+    hjLeaveReqState = *(int*)(HJ_SM_BASE + HJ_SM_STATE);
+
+    // NOTE: 0x195900 is the world CONNECT, not a teardown -- section 47 had this right
+    // and a later build briefly forgot it. With the flag at 0x001A5FC0 set it jumps
+    // straight to state 10 and returns WITHOUT connecting (0x195978 -> 0x195988), so
+    // forcing that path here would skip the join entirely. The `leavecall` name is a
+    // misnomer inherited from section 39; it is the connect request.
+    //
+    // Snapshot the connect counter at REQUEST time. 0x195900 with flag == 0 does not
+    // leave here -- it queues an async completion that can land hundreds of ms later.
+    hjLeavePending = 1;
+    hjLeaveConnectSeq = hjConnectCalls;
+    // And the state the manager was in BEFORE any of this. This is the value a stale
+    // leave must be unwound to. The suppression-time snapshot is too late for that:
+    // by then the completion callback has already written 10 ("leave on next tick"),
+    // and restoring 10 wedged the manager in exactly the state we were avoiding --
+    // measured as `smrestore: state 5 -> 10` followed by a client that sat in menus
+    // forever with every object healthy and cid=1.
+
+    if (hjLeaveCallerLogged < 8) {
+        ++hjLeaveCallerLogged;
+        HOTJOIN_LOG("leavecall: ra=%08x state=%d flag=%d f174=%d menus=%d game=%d\n",
+            ra, *(int*)0x001A5F70, *(int*)0x001A5FC0, *(int*)0x001A5FC4,
+            isInMenus(), isInGame());
+    }
+
+    return internal_hjNetLeaveGame();
+}
+
+void hjInstallLeaveCallerProbe(void)
+{
+    if (!isInMenus())
+        return;
+
+    // Re-arm if the overlay was reloaded: the sites read as `jal 0x195900` again only
+    // when the original module is back.
+    if (hjLeaveSitesHooked
+        && *(u32*)HJ_LEAVE_SITE_A != HJ_LEAVE_CALL
+        && *(u32*)HJ_LEAVE_SITE_B != HJ_LEAVE_CALL)
+        return;
+
+    if (*(u32*)HJ_LEAVE_SITE_A != HJ_LEAVE_CALL ||
+        *(u32*)HJ_LEAVE_SITE_B != HJ_LEAVE_CALL ||
+        *(u32*)HJ_LEAVE_SITE_C != HJ_LEAVE_CALL ||
+        *(u32*)HJ_LEAVE_SITE_D != HJ_LEAVE_CALL) {
+        if (!hjLeaveSitesHooked) {
+            hjLeaveSitesHooked = 1;   // report once, then stop looking
+            HOTJOIN_LOG("leavecall: sites read %08x/%08x/%08x/%08x, expected %08x -- NOT hooked\n",
+                *(u32*)HJ_LEAVE_SITE_A, *(u32*)HJ_LEAVE_SITE_B,
+                *(u32*)HJ_LEAVE_SITE_C, *(u32*)HJ_LEAVE_SITE_D, HJ_LEAVE_CALL);
+        }
+        return;
+    }
+
+    HOOK_JAL(HJ_LEAVE_SITE_A, &hjNetLeaveGameHook);
+    HOOK_JAL(HJ_LEAVE_SITE_B, &hjNetLeaveGameHook);
+    HOOK_JAL(HJ_LEAVE_SITE_C, &hjNetLeaveGameHook);
+    HOOK_JAL(HJ_LEAVE_SITE_D, &hjNetLeaveGameHook);
+    hjLeaveSitesHooked = 1;
+    HOTJOIN_LOG("leavecall: hooked 4 menu sites\n");
+}
+
+// ---------------------------------------------------------------------------
+// Hotjoin: the OTHER half of the teardown.
+//
+// 0x001961C4 performs a leave with TWO calls, not one:
+//
+//     0x1961c4  jal 0x14b1b8   -> lock; ctx->0x1C (= 0x171ee8); unlock
+//                                 graceful: broadcast msg 18, retire all messages,
+//                                 ctx->0xE8 = 0
+//     0x1961cc  jal 0x14b218   -> lock; 0x14f2c8; unlock
+//                                 DESTRUCTOR: memset all 256 peer records (40 bytes
+//                                 each), peers->0x434 = -1, 0x408 = 256, 0x404 = 256,
+//                                 0x400 = 0, 0x430 = 0, 0x420..0x42c = 0, 0x438 = 0,
+//                                 then 0x14f870 frees the table
+//     0x1961d4  state = 5
+//
+// Suppressing only the first was strictly worse than suppressing neither. Measured:
+// the graceful half was skipped, the destructor ran anyway, and the joiner was left
+// reading freed memory --
+//     peers: me=256 gate=0 p408=256 mine=00000000 mine08=-1
+//     peers[0] 0019dc88 t08=32859768 f00=0019dc80 ...   <- heap residue
+// -- followed by a dead TCP connection and a network error on screen. GameSettings
+// survived (gs stayed non-NULL, which is why the roster was still readable), so the
+// graceful suppression itself worked; it was the unmatched destructor that corrupted
+// the session.
+//
+// So: both halves are skipped together or neither is. hjLeaveSkipDestroy is set only by
+// hjLeaveSessionHook when it actually suppresses, and cleared whenever it does not, so
+// the destructor can never be skipped on its own.
+#define HJ_DESTROY_CALL   (0x0c052c86)   // jal 0x14b218
+#define HJ_DESTROY_SITE_A (0x001961cc)   // base exe, always resident
+#define HJ_DESTROY_SITE_B (0x0095c054)   // second copy of the same sequence
+
+extern int internal_hjDestroyPeers(void * peers);   // 0x14b218
+
+int hjPeersDestroyHook(void * peers)
+{
+    if (0 && hjLeaveSkipDestroy) {
+        hjLeaveSkipDestroy = 0;
+        if (hjDestroyLogged < 8) {
+            ++hjDestroyLogged;
+            HOTJOIN_LOG("destroy: SUPPRESSED peers=%08x (paired with the leave above)\n",
+                (u32)peers);
+        }
+        return 0;
+    }
+
+    if (hjDestroyLogged < 8) {
+        u32 ra = (u32)__builtin_return_address(0);
+        ++hjDestroyLogged;
+        // ra names WHICH copy of the leave body ran: 0x001961D0 is the base-exe
+        // 0x196128, 0x0095C058 is the overlay twin. Neither leaveact (3 known call
+        // sites of 0x196128) nor backout (5 sites of 0x6D1928) logged a single line
+        // this run while destroy fired five times, so the teardown is reached through
+        // a path not in either list.
+        HOTJOIN_LOG("destroy: ra=%08x peers=%08x sm=%d cid=%d menus=%d game=%d gs=%p\n",
+            ra, (u32)peers, *(int*)(HJ_SM_BASE + HJ_SM_STATE),
+            *(int*)(HJ_SM_BASE + HJ_SM_CLIENTID), isInMenus(), isInGame(), gameGetSettings());
+    }
+
+    return internal_hjDestroyPeers(peers);
+}
+
+void hjInstallDestroyProbe(void)
+{
+    if (hjDestroySitesHooked)
+        return;
+
+    // Site A is base exe and always present. Site B is only checked, never required.
+    if (*(u32*)HJ_DESTROY_SITE_A != HJ_DESTROY_CALL) {
+        hjDestroySitesHooked = 1;
+        HOTJOIN_LOG("destroy: site A %08x holds %08x, expected %08x -- NOT hooked\n",
+            HJ_DESTROY_SITE_A, *(u32*)HJ_DESTROY_SITE_A, HJ_DESTROY_CALL);
+        return;
+    }
+
+    HOOK_JAL(HJ_DESTROY_SITE_A, &hjPeersDestroyHook);
+    if (*(u32*)HJ_DESTROY_SITE_B == HJ_DESTROY_CALL)
+        HOOK_JAL(HJ_DESTROY_SITE_B, &hjPeersDestroyHook);
+    hjDestroySitesHooked = 1;
+    HOTJOIN_LOG("destroy: hooked site A%s\n",
+        (*(u32*)HJ_DESTROY_SITE_B == (u32)&hjPeersDestroyHook) ? " and B" : " only");
+}
+
+// ---------------------------------------------------------------------------
+// Hotjoin: the world-connect COMPLETION callback, hooked at its source.
+//
+// Everything sections 40-46 built downstream guards for turns out to be one lifecycle:
+//
+//   0x195620   sync connect            state 6 -> 7, session ptr stored
+//   0x195900   0x14b448 -> ctx->0x2C = 0x16f770 = connect[1], the world connect,
+//              with a descriptor whose +0x20 is 0x196088          state 9
+//   0x196088   ON CONNECT COMPLETE: 0x14af70 -> 0x14c198 copies peers->0x404 (my peer
+//              index) into +0x08 = tNW_Info.myClientIndex; records it in the slot
+//              arrays at +0x140/+0x6a5; state 10
+//   0x1961c4   next tick, state == 10: 0x14b1b8 + 0x14b218 + epilogue   TEARDOWN
+//
+// That is a PROBE -- connect, learn your client id, disconnect. The hot-join menu site
+// (0x6d0ec4/0x6d0ee0) runs it as the join, so the manager tears its own session down
+// ~200 ms in. The two vanilla sites (0x6aa2b0, 0x6adc20) pre-set the flag at 0x1A5FC0,
+// which makes 0x195900 skip 0x14b448 entirely: no descriptor, no 0x196088, no teardown.
+//
+// So the callback is registered ONLY on the hot-join path. Hooking it is inherently
+// hot-join-only, and vanilla is untouched by construction. If `cc:` lines ever appear
+// during a vanilla staging join, that reasoning is wrong and this must come out.
+//
+// The callback's address is not in a static slot -- 0x195900 materialises it with
+// `lui v1,0x19; addiu v1,v1,0x6088` and stores it to sp+0x20 for the 0x14b448 call. So
+// those two instructions are repointed at hjConnectCompleteHook, which forwards to the
+// original (cid is learned exactly as vanilla does it) and then holds the manager at 7
+// (established) instead of leaving it at 10 for the teardown tick. Race-free: we are
+// inside the completion, and the tick that acts on 10 has not run yet.
+#define HJ_CC_LUI_SITE    (0x001959d8)   // lui   v1,0x19
+#define HJ_CC_ADDIU_SITE  (0x001959e4)   // addiu v1,v1,0x6088
+#define HJ_CC_LUI_ORIG    (0x3c030019)
+#define HJ_CC_ADDIU_ORIG  (0x24636088)
+#define HJ_CC_ORIG        (0x00196088)
+
+void hjConnectCompleteHook(void * result)
+{
+    u32 ra = (u32)__builtin_return_address(0);
+    void (*orig)(void *) = (void (*)(void *))HJ_CC_ORIG;
+    int before = *(int*)(HJ_SM_BASE + HJ_SM_STATE);
+    int after, held = 0;
+
+    orig(result);
+
+    after = *(int*)(HJ_SM_BASE + HJ_SM_STATE);
+
+    // Hold at 7 only when this is a real session on a joiner. 10 with a NULL session is
+    // the vanilla no-op reset and must be left alone; 11 is the error path.
+    // LOG ONLY. Holding at 7 here broke a vanilla staging join (section 48): the probe
+    // must complete and tear down so the menu can issue connect[2], the real join.
+    (void)held;
+
+    if (hjCcLogged < 8) {
+        ++hjCcLogged;
+        HOTJOIN_LOG("cc: ra=%08x result=%08x r0=%d state %d -> %d%s cid=%d session=%08x menus=%d game=%d\n",
+            ra, (u32)result, result ? *(int*)result : -1, before, after,
+            held ? " HELD at 7" : "",
+            *(int*)(HJ_SM_BASE + HJ_SM_CLIENTID),
+            *(u32*)(HJ_SM_BASE + HJ_SM_SESSION),
+            isInMenus(), isInGame());
+    }
+}
+
+// The descriptor's other two callbacks, hooked the same way. +0x30 (0x197550) is the
+// one that sets 0x1A5E50+0x169, which is exactly what the staging update at 0x6bec84
+// backs out on. Naming the event that fires it, with the event struct's first words.
+#define HJ_CB28_LUI   (0x001959dc)   // lui   a2,0x19
+#define HJ_CB28_ADDIU (0x001959e8)   // addiu a2,a2,0x71e8
+#define HJ_CB30_LUI   (0x001959e0)   // lui   a3,0x19
+#define HJ_CB30_ADDIU (0x001959ec)   // addiu a3,a3,0x7550
+#define HJ_CB28_ORIG  (0x001971e8)
+#define HJ_CB30_ORIG  (0x00197550)
+
+static void hjLogCb(const char * which, u32 ra, void * ev)
+{
+    if (hjCbLogged >= 12) return;
+    ++hjCbLogged;
+    HOTJOIN_LOG("%s: ra=%08x ev=%08x ev0=%08x ev4=%d ev8=%d  cid=%d sm=%d f168=%d f169=%d menus=%d\n",
+        which, ra, (u32)ev,
+        ev ? *(u32*)ev : 0, ev ? *(int*)((u32)ev + 4) : -1, ev ? *(int*)((u32)ev + 8) : -1,
+        *(int*)(HJ_SM_BASE + HJ_SM_CLIENTID), *(int*)(HJ_SM_BASE + HJ_SM_STATE),
+        *(u8*)(HJ_SM_BASE + 0x168), *(u8*)(HJ_SM_BASE + 0x169), isInMenus());
+}
+
+int hjCb28Hook(void * ev)
+{
+    int (*orig)(void *) = (int (*)(void *))HJ_CB28_ORIG;
+    hjLogCb("cb28", (u32)__builtin_return_address(0), ev);
+    return orig(ev);
+}
+
+int hjCb30Hook(void * ev)
+{
+    int (*orig)(void *) = (int (*)(void *))HJ_CB30_ORIG;
+    int r;
+    hjLogCb("cb30", (u32)__builtin_return_address(0), ev);
+    r = orig(ev);
+    if (hjCbLogged < 12) {
+        ++hjCbLogged;
+        HOTJOIN_LOG("cb30: after -> f168=%d f169=%d f16c=%d ret=%d\n",
+            *(u8*)(HJ_SM_BASE + 0x168), *(u8*)(HJ_SM_BASE + 0x169), *(int*)(HJ_SM_BASE + 0x16c), r);
+    }
+    return r;
+}
+
+static void hjRepoint(u32 luiSite, u32 addiuSite, u32 luiOrig, u32 addiuOrig, u32 fn, const char * name)
+{
+    u32 hi = (fn >> 16) + ((fn & 0x8000) ? 1 : 0), lo = fn & 0xffff;
+    if (*(u32*)luiSite != luiOrig || *(u32*)addiuSite != addiuOrig) {
+        HOTJOIN_LOG("%s: sites read %08x/%08x, expected %08x/%08x -- NOT hooked\n",
+            name, *(u32*)luiSite, *(u32*)addiuSite, luiOrig, addiuOrig);
+        return;
+    }
+    POKE_U32(luiSite,   (luiOrig   & 0xffff0000) | (hi & 0xffff));
+    POKE_U32(addiuSite, (addiuOrig & 0xffff0000) | lo);
+    HOTJOIN_LOG("%s: repointed -> %08x\n", name, fn);
+}
+
+// ---------------------------------------------------------------------------
+// Hotjoin: the JOIN RESULT handler.
+//
+// The join function 0x6d0d50 spins at 0x6d1068 after connecting, pumping the manager
+// (0x195500) until 0x1A5E50+0x630 clears. Exactly one thing clears it: the handler at
+// 0x19af80 (RT dispatch table slot 0x12), which stores the first payload word into
+// +0x634 and zeroes +0x630. The join function then reads +0x634:
+//     0 -> proceed (0x6d1e30, s2 = 1, success)
+//     1/3/4/5 -> error string 50/51/49/52, back out via 0x6d112c
+//     2 -> silent back out via 0x6d1174
+// On the wire: a vanilla joiner receives 02-12-00-00-00-00 (word 0); the in-game host
+// sends the hot-joiner 02-12-04-00-00-00 (word 4). Same message, different verdict.
+//
+// This hook logs what arrives, and -- only on a joiner whose roster already shows the
+// host at GAME_START, i.e. a hot-join by construction -- rewrites a nonzero verdict to
+// 0 before the original stores it. Vanilla's word is already 0, so vanilla is untouched.
+#define HJ_RT12_TYPE  (0x12)
+#define HJ_RT12_ORIG  (0x0019af80)
+
+int hjRt12Hook(void * a0, void * a1, int a2, u8 * payload)
+{
+    int (*orig)(void *, void *, int, u8 *) = (int (*)(void *, void *, int, u8 *))hjRt12Orig;
+    u32 ra = (u32)__builtin_return_address(0);
+    GameSettings * gs = gameGetSettings();
+    int word = payload ? *(int*)payload : -1;
+    int sm = *(int*)(HJ_SM_BASE + HJ_SM_STATE);
+    int joining = isInMenus() && !isInGame() && (sm == 9 || sm == 10);
+    int forced = 0;
+
+    // Never let the join wait finish while gs is NULL. 0x19AF80 stores the verdict into
+    // +0x634 and CLEARS +0x630, which releases the loop; if the settings have not landed
+    // yet, staging is entered with a NULL GameSettings and faults immediately at
+    // 0x6BF470. Measured exactly that, twice.
+    //
+    // Skipping orig() leaves +0x630 set and the loop waiting. The host repeats this
+    // message about once a second, so a later one completes the join once gs exists.
+    // If it never does, we stop deferring and hand the loop a verdict of 2, which is its
+    // own silent back-out -- a clean failure instead of a crash. The join function's own
+    // deadline (0x6D5F80) would catch it too; this just makes the outcome explicit.
+    // Defer ANY verdict while gs is NULL, not just 0. Measured: on a rejoin the server's
+    // verdict-0 message never arrives -- only the host's 4 does -- so a rule that only
+    // deferred 0 let the 4 through, and the loop died on error 49 with no settings.
+    if (payload && joining && !gs) {
+        if (++hjRt12Defer <= HJ_RT12_DEFER_MAX) {
+            if (hjRt12Logged < 8) {
+                ++hjRt12Logged;
+                HOTJOIN_LOG("rt12: DEFER %d/%d (word=%d, gs is NULL) ra=%08x f630=%d sm=%d\n",
+                    hjRt12Defer, HJ_RT12_DEFER_MAX, word, ra, *(u8*)(HJ_SM_BASE + 0x630), sm);
+            }
+            return 0;
+        }
+        *(int*)payload = 2;   // give up cleanly rather than enter staging with no settings
+        word = 2;
+    } else if (gs) {
+        hjRt12Defer = 0;
+    }
+
+    // The host answers a hot-join with verdict 4. Rewrite it only when the settings are
+    // in hand and the roster already shows the host in-game.
+    if (payload && word != 0 && gs && gs->PlayerStates[0] >= 7) {
+        *(int*)payload = 0;
+        forced = 1;
+    }
+    if (hjRt12Logged < 8) {
+        ++hjRt12Logged;
+        HOTJOIN_LOG("rt12: ra=%08x a2=%d word=%d%s host=%d hostState=%d f630=%d f634=%d sm=%d\n",
+            ra, a2, word, forced ? " -> FORCED 0" : "", gameAmIHost(),
+            gs ? gs->PlayerStates[0] : -9,
+            *(u8*)(HJ_SM_BASE + 0x630), *(int*)(HJ_SM_BASE + 0x634),
+            *(int*)(HJ_SM_BASE + HJ_SM_STATE));
+    }
+    return orig(a0, a1, a2, payload);
+}
+
+void hjInstallRt12Probe(void)
+{
+    u32 table, maxTypes, st, n = 0;
+    if (hjRt12Installed) return;
+    table = *(u32*)HJ_RT_HANDLER_TABLE_PTR;
+    maxTypes = *(u32*)HJ_RT_MAXTYPES_PTR;
+    if (!table || !maxTypes || maxTypes > 256) {
+        HOTJOIN_LOG("rt12: table %08x maxTypes %d -- NOT hooked\n", table, (int)maxTypes);
+        return;
+    }
+    hjRt12Installed = 1;
+    for (st = 0; st < HJ_RT_MAX_STACKS; ++st) {
+        u32 * slot = (u32*)(table + (st * maxTypes * 4) + (HJ_RT12_TYPE * 4));
+        if (*slot == HJ_RT12_ORIG) {
+            if (!hjRt12Orig) hjRt12Orig = *slot;
+            *slot = (u32)&hjRt12Hook;
+            ++n;
+        }
+    }
+    HOTJOIN_LOG("rt12: hooked slot 0x12 in %d of %d stacks (orig %08x)\n", (int)n, HJ_RT_MAX_STACKS, hjRt12Orig);
+}
+
+// ---------------------------------------------------------------------------
+// Hotjoin: the EVENT DRAIN.
+//
+// The per-frame menu network update 0x195ae8 (which the join wait pumps through
+// 0x195500) calls 0x14b160 = lock; 0x14f298(buf); unlock. 0x14f298 memcpy's the 40-byte
+// pending-event block at 0x001CDAB0 into buf: five 8-byte entries. The caller stores the
+// LAST non-zero code into 0x1A5E50+0x2dc, and the join loop at 0x6d10a4 treats any
+// non-zero +0x2dc as fatal (error 40, silent back-out at 0x6d1174).
+//
+// Measured: on every hot-join attempt +0x2dc reads 12 within ~20 ms of the completion,
+// before the 02-12 verdict has arrived; on vanilla it stays 0. This hook logs every code
+// the drain returns, and -- only on a joiner whose roster already shows the host at
+// GAME_START, and only while the join wait flag +0x630 is still set -- removes code-12
+// entries from both the copy and the source block, so the wait continues to the verdict.
+#define HJ_EV_SITE   (0x0014b188)   // jal 0x14f298 inside 0x14b160
+#define HJ_EV_CALL   (0x0c053ca6)
+#define HJ_EV_BLOCK  (0x001CDAB0)
+#define HJ_EV_DROP_CODE (12)
+
+extern int internal_hjEventCopy(void * buf);   // 0x14f298
+
+int hjEventDrainHook(void * buf)
+{
+    int r = internal_hjEventCopy(buf);
+    u32 * e = (u32*)buf;
+    u32 * src = (u32*)HJ_EV_BLOCK;
+    GameSettings * gs = gameGetSettings();
+    int i, any = 0, dropped = 0;
+    // gs is an EXCLUSION here, never a requirement. Gating on `gs != NULL` was wrong
+    // three separate times (the ev drop, the promote, the SYNC block): the join stalls
+    // BEFORE gs exists -- gs only appears once staging is entered -- so any guard that
+    // demands it can never fire in the window it was written for. Measured: every ev
+    // line carrying code 12 shows `hot=0 f630=0 gs=0x0`.
+    //
+    // The window is: in menus, not in game, a connect in flight or just completed
+    // (manager 9 or 10), and no settings yet. That is exactly the join wait and nothing
+    // else -- staging and in-game keep their real event 12.
+    // Event 12 is a TRANSIENT RACE, not a persistent error. hjWatchLatch proved it:
+    // 0x1CF760 flickers 0 -> 7 -> 0 within one or two frames, on stacks 1 and 2, at
+    // manager states 5/6/9/10, before and during joins. 0x14EE08 memsets that table at
+    // the top of every net tick and repopulates it during its walk, so code 12 fires
+    // whenever the walk reaches stack i and finds table[i] already set EARLIER IN THE
+    // SAME TICK. The "stale latch surviving a session" model of sections 54-55 was wrong.
+    //
+    // The join loop polls +0x2DC every iteration and treats any non-zero value as fatal,
+    // so a long enough wait is near-certain to catch a flicker. Measured: two consecutive
+    // attempts died 150 ms after connect with `gs=0x1f7ed20 st=7/0 cl=0/1` -- settings
+    // present, roster correct, nothing actually wrong with either join.
+    //
+    // Dropping this is safe ONLY because hjRt12Hook now refuses to complete a join while
+    // gs is NULL. That pairing matters: dropping alone let a join finish with no settings
+    // and staging faulted at 0x6BF470 dereferencing the NULL; refusing alone left the
+    // transient free to kill healthy joins. Each covers the other's failure mode.
+    int sm = *(int*)(HJ_SM_BASE + HJ_SM_STATE);
+    int hot = (isInMenus() && !isInGame() && (sm == 9 || sm == 10));
+    (void)gs;
+
+    if (!buf) return r;
+    for (i = 2; i < 10; ++i) if (e[i]) any = 1;   // e[0] is the block size (0x28), not a code
+    if (hot) {
+        // entries at +8,+16,+24,+32 (code word), and the 5th code at +36
+        for (i = 2; i <= 9; i += 2)
+            if (e[i] == HJ_EV_DROP_CODE) { e[i] = 0; src[i] = 0; ++dropped; }
+        if (e[9] == HJ_EV_DROP_CODE) { e[9] = 0; src[9] = 0; ++dropped; }
+    }
+    if (dropped) hjEvDropped += dropped;
+    if ((any || dropped) && hjEvLogged < 16) {
+        ++hjEvLogged;
+        HOTJOIN_LOG("ev: [%08x %08x | %08x %08x | %08x %08x | %08x %08x | %08x %08x]%s hot=%d f630=%d sm=%d stk=%08x/%08x/%08x/%08x\n",
+            e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7], e[8], e[9],
+            dropped ? " DROPPED 12" : "", hot, *(u8*)(HJ_SM_BASE + 0x630), sm,
+            *(u32*)0x001CF760, *(u32*)0x001CF764, *(u32*)0x001CF768, *(u32*)0x001CF76C);
+        // The stack registry. 0x14F780 registers a peers object at 0x1DD648[idx] only
+        // when the slot is EMPTY (else it returns 23), and 0x14F8C8 -> 0x14C228 ->
+        // 0x1521C0 nulls the slot when the object is destroyed. 0x1CF760[2] holding 7
+        // means SOME peers object with ->0x448 == 2 had a send fail. Printing the
+        // registry says whether that object is the live one or a leftover the
+        // destructor never reached.
+        {
+            u32 * reg = (u32*)0x001CD648;   /* NOT 0x1DD648: addiu -10680 with lui 0x1d is 0x1D0000-0x29B8 */
+            HOTJOIN_LOG("ev: reg=%08x/%08x/%08x/%08x  idx=%d/%d/%d/%d  gate=%d/%d/%d/%d\n",
+                reg[0], reg[1], reg[2], reg[3],
+                reg[0] ? *(int*)(reg[0] + 0x448) : -1, reg[1] ? *(int*)(reg[1] + 0x448) : -1,
+                reg[2] ? *(int*)(reg[2] + 0x448) : -1, reg[3] ? *(int*)(reg[3] + 0x448) : -1,
+                reg[0] ? *(int*)(reg[0] + 0x430) : -1, reg[1] ? *(int*)(reg[1] + 0x430) : -1,
+                reg[2] ? *(int*)(reg[2] + 0x430) : -1, reg[3] ? *(int*)(reg[3] + 0x430) : -1);
+        }
+    }
+    return r;
+}
+
+void hjInstallEventDrainHook(void)
+{
+    if (*(u32*)HJ_EV_SITE != HJ_EV_CALL) {
+        HOTJOIN_LOG("ev: site %08x holds %08x, expected %08x -- NOT hooked\n",
+            HJ_EV_SITE, *(u32*)HJ_EV_SITE, HJ_EV_CALL);
+        return;
+    }
+    HOOK_JAL(HJ_EV_SITE, &hjEventDrainHook);
+    HOTJOIN_LOG("ev: event drain hooked at %08x\n", HJ_EV_SITE);
+}
+
+// ---------------------------------------------------------------------------
+// Hotjoin: the ERROR LATCH that becomes event 12.
+//
+// 0x14ee08 (top of every net tick) raises 12 when 0x1CF760[0] is non-zero after its
+// per-stack walk. The only base-exe writer of that table is 0x14ce48, which stores
+// 0x152fb8(peers, code) into 0x1CF760[peers->0x448], and 0x14ce48 has exactly one jal
+// caller: 0x1503e4, in the peer close-with-reason region. Log-only: names the peers,
+// stack, code and caller at the moment the latch is set.
+#define HJ_LATCH_SITE (0x001503e4)
+#define HJ_LATCH_CALL (0x0c053392)   // jal 0x14ce48
+
+extern int internal_hjSetErrorLatch(void * peers, int code);   // 0x14ce48
+
+int hjErrorLatchHook(void * peers, int code)
+{
+    u32 ra = (u32)__builtin_return_address(0);
+    int r = internal_hjSetErrorLatch(peers, code);
+    if (hjLatchLogged < 8) {
+        ++hjLatchLogged;
+        HOTJOIN_LOG("latch: ra=%08x peers=%08x stack=%d code=%d -> ret=%d table=%08x/%08x/%08x/%08x f630=%d sm=%d host=%d\n",
+            ra, (u32)peers, peers ? *(int*)((u32)peers + 0x448) : -1, code, r,
+            *(u32*)0x001CF760, *(u32*)0x001CF764, *(u32*)0x001CF768, *(u32*)0x001CF76C,
+            *(u8*)(HJ_SM_BASE + 0x630), *(int*)(HJ_SM_BASE + HJ_SM_STATE), gameAmIHost());
+    }
+    return r;
+}
+
+// Called every frame, no latch. 0x1503E4 is base exe so it cannot be swapped out, but
+// this probe has never logged a single line while 0x1CF760[2] held 7 on every failing
+// tick -- and 0x14CE48 has no other executing caller (the second `jal` at 0x91626C is
+// in the duplicate image copy at +0x7C5E88, which also explains 0x95C04C and the high
+// callers of 0x196128). Either the hook is not installed or the write arrives another
+// way; re-checking every frame and logging on install settles which.
+// A POLLING watcher on the latch table, not a hook.
+//
+// Every probe so far has hooked a call site deduced from static analysis, and that has
+// produced a contradiction: 0x1CF760 has exactly one writer in the image (0x14CE48),
+// reached from exactly one executing call site (0x1503E4), the hook there is installed,
+// and it has never once logged while 0x1CF760[2] held 7 on every failing tick. So the
+// write arrives by a path the scan cannot see -- most likely a store whose base register
+// is loaded from memory rather than built with `lui`, which the search would miss.
+//
+// This assumes nothing about the writer. It samples the four entries every frame and
+// reports any 0 -> non-zero or non-zero -> 0 transition with the surrounding state, so
+// the exact frame is pinned even though the instruction is not. Four loads per frame.
+void hjWatchLatch(void)
+{
+    u32 * t = (u32*)0x001CF760;
+    u32 * reg = (u32*)0x001CD648;
+    int i;
+
+    for (i = 0; i < 4; ++i) {
+        if (t[i] == hjLatchSeen[i])
+            continue;
+        if (hjLatchWatchLogged < 24) {
+            u32 ctx = *(u32*)HJ_NET_CTX_PTR;
+            ++hjLatchWatchLogged;
+            HOTJOIN_LOG("latchwatch: [%d] %08x -> %08x  sm=%d cid=%d gs=%p live=%08x reg=%08x/%08x/%08x/%08x menus=%d game=%d\n",
+                i, hjLatchSeen[i], t[i],
+                *(int*)(HJ_SM_BASE + HJ_SM_STATE), *(int*)(HJ_SM_BASE + HJ_SM_CLIENTID),
+                gameGetSettings(), ctx ? *(u32*)(ctx + HJ_CTX_PEERS) : 0,
+                reg[0], reg[1], reg[2], reg[3], isInMenus(), isInGame());
+        }
+        hjLatchSeen[i] = t[i];
+    }
+}
+
+void hjInstallErrorLatchProbe(void)
+{
+    if (*(u32*)HJ_LATCH_SITE != HJ_LATCH_CALL)
+        return;   // already ours, or not the expected instruction
+    HOOK_JAL(HJ_LATCH_SITE, &hjErrorLatchHook);
+    HOTJOIN_LOG("latch: hooked at %08x (site now %08x)\n",
+        HJ_LATCH_SITE, *(u32*)HJ_LATCH_SITE);
+}
+
+void hjInstallConnectCompleteHook(void)
+{
+    u32 fn = (u32)&hjConnectCompleteHook;
+    u32 hi = (fn >> 16) + ((fn & 0x8000) ? 1 : 0);   // addiu sign-extends its immediate
+    u32 lo = fn & 0xffff;
+
+    if (hjCcInstalled)
+        return;
+    hjCcInstalled = 1;
+
+    if (*(u32*)HJ_CC_LUI_SITE != HJ_CC_LUI_ORIG || *(u32*)HJ_CC_ADDIU_SITE != HJ_CC_ADDIU_ORIG) {
+        HOTJOIN_LOG("cc: sites read %08x/%08x, expected %08x/%08x -- NOT hooked\n",
+            *(u32*)HJ_CC_LUI_SITE, *(u32*)HJ_CC_ADDIU_SITE, HJ_CC_LUI_ORIG, HJ_CC_ADDIU_ORIG);
+        return;
+    }
+
+    POKE_U32(HJ_CC_LUI_SITE,   0x3c030000 | (hi & 0xffff));
+    POKE_U32(HJ_CC_ADDIU_SITE, 0x24630000 | lo);
+    HOTJOIN_LOG("cc: completion callback repointed 0x196088 -> %08x (lui %04x addiu %04x)\n",
+        fn, hi & 0xffff, lo);
+    hjInstallEventDrainHook();
+    hjInstallErrorLatchProbe();
+    hjRepoint(HJ_CB28_LUI, HJ_CB28_ADDIU, 0x3c060019, 0x24c671e8, (u32)&hjCb28Hook, "cb28");
+    hjRepoint(HJ_CB30_LUI, HJ_CB30_ADDIU, 0x3c070019, 0x24e77550, (u32)&hjCb30Hook, "cb30");
+}
+
+// ---------------------------------------------------------------------------
+// Hotjoin: WHO calls the leave ACTION.
+//
+// 0x196128 is not a tick. The host reaches state 10 and stays there for the entire
+// game with its session intact; 0x196128 only runs when a menu decides to leave. On the
+// joiner it runs ~200 ms after every connect, which is the join -> LeftGameWorld ->
+// JoinedChatWorld -> retry cycle Medius logs every 2 s. That decision is made in the
+// overlay, at one of exactly three sites. This names which one, and what the manager,
+// roster and peers looked like at that instant.
+#define HJ_LEAVEACT_CALL   (0x0c06584a)   // jal 0x196128
+#define HJ_LEAVEACT_SITE_A (0x005f9a94)
+#define HJ_LEAVEACT_SITE_B (0x006ac684)
+#define HJ_LEAVEACT_SITE_C (0x006d1948)
+
+extern int internal_hjLeaveAction(void);   // 0x196128
+
+int hjLeaveActionHook(void)
+{
+    u32 ra = (u32)__builtin_return_address(0);
+    GameSettings * gs = gameGetSettings();
+    u32 ctx = *(u32*)HJ_NET_CTX_PTR;
+    u32 peers = ctx ? *(u32*)(ctx + HJ_CTX_PEERS) : 0;
+    void * p0 = peers ? internal_hjPeerLookup((void*)peers, 0) : 0;
+    void * p1 = peers ? internal_hjPeerLookup((void*)peers, 1) : 0;
+
+    if (hjLeaveActLogged < 8) {
+        ++hjLeaveActLogged;
+        HOTJOIN_LOG("leaveact: ra=%08x sm=%d cid=%d session=%08x gs=%p n=%d roster[0]=%d/%d roster[1]=%d/%d p0=%d p1=%d p438=%d menus=%d game=%d\n",
+            ra, *(int*)(HJ_SM_BASE + HJ_SM_STATE), *(int*)(HJ_SM_BASE + HJ_SM_CLIENTID),
+            *(u32*)(HJ_SM_BASE + HJ_SM_SESSION), (void*)gs,
+            gs ? gs->PlayerCount : -1,
+            gs ? gs->PlayerClients[0] : -9, gs ? gs->PlayerStates[0] : -9,
+            gs ? gs->PlayerClients[1] : -9, gs ? gs->PlayerStates[1] : -9,
+            p0 ? *(int*)((u32)p0 + 0x08) : -1, p1 ? *(int*)((u32)p1 + 0x08) : -1,
+            peers ? *(int*)(peers + 0x438) : -1,
+            isInMenus(), isInGame());
+    }
+    return internal_hjLeaveAction();
+}
+
+// Re-checked every menus frame, with NO "already hooked" latch.
+//
+// These are overlay addresses. The previous version latched hjLeaveActHooked on the
+// first success and never looked again -- so when the module was swapped (which
+// hjInstallLeaveCallerProbe logs as `leavecall: hooked 4 menu sites`, seen mid-session)
+// the HOOK_JALs went with it while the latch still claimed they were installed. The
+// probe then sat silent through five teardowns and its silence read as "this path was
+// not taken", which was wrong.
+//
+// A site holding the ORIGINAL call is uninstalled and gets hooked; a site holding our
+// hook does not match and is skipped. Idempotent, and it survives any number of reloads.
+void hjInstallLeaveActionProbe(void)
+{
+    int n = 0;
+    if (!isInMenus())
+        return;
+    if (*(u32*)HJ_LEAVEACT_SITE_A == HJ_LEAVEACT_CALL) { HOOK_JAL(HJ_LEAVEACT_SITE_A, &hjLeaveActionHook); ++n; }
+    if (*(u32*)HJ_LEAVEACT_SITE_B == HJ_LEAVEACT_CALL) { HOOK_JAL(HJ_LEAVEACT_SITE_B, &hjLeaveActionHook); ++n; }
+    if (*(u32*)HJ_LEAVEACT_SITE_C == HJ_LEAVEACT_CALL) { HOOK_JAL(HJ_LEAVEACT_SITE_C, &hjLeaveActionHook); ++n; }
+    if (n)
+        HOTJOIN_LOG("leaveact: hooked %d of 3 sites\n", n);
+}
+
+// ---------------------------------------------------------------------------
+// Hotjoin: WHICH back-out site.
+//
+// leaveact resolved the leave to the helper at 0x6d1928 (ra=006d1950), which has ten
+// callers. Five are in the join/staging overlay. This names the one that fires, with
+// the manager state, the roster, the host-state flag byte at 0x1A7118 and a0 at that
+// instant. Same overlay-guarded install as the leavecall probe.
+#define HJ_BACKOUT_CALL   (0x0c1b464a)   // jal 0x6d1928
+#define HJ_BACKOUT_A (0x006c0cdc)   // in 0x6c0c60: dialog 5699 answered 1, or a2==0
+#define HJ_BACKOUT_B (0x006d0f04)   // in 0x6d0d50 (the join fn): 0x195900 failed
+#define HJ_BACKOUT_C (0x006d112c)   // in 0x6d0d50: poll loop
+#define HJ_BACKOUT_D (0x006d1174)   // in 0x6d0d50: poll loop
+#define HJ_BACKOUT_E (0x006d1838)   // in 0x6d12a8
+
+extern int internal_hjBackout(int a0);   // 0x6d1928 (overlay)
+
+int hjBackoutHook(int a0)
+{
+    u32 ra = (u32)__builtin_return_address(0);
+    GameSettings * gs = gameGetSettings();
+    if (hjBackoutLogged < 8) {
+        ++hjBackoutLogged;
+        HOTJOIN_LOG("backout: ra=%08x a0=%08x sm=%d cid=%d f630=%d f634=%d f2dc=%08x f638=%d err=%d f168=%d f169=%d f2ec=%08x flag7118=%d gs=%p n=%d st=%d/%d cl=%d/%d menus=%d\n",
+            ra, (u32)a0, *(int*)(HJ_SM_BASE + HJ_SM_STATE), *(int*)(HJ_SM_BASE + HJ_SM_CLIENTID),
+            *(u8*)(HJ_SM_BASE + 0x630), *(int*)(HJ_SM_BASE + 0x634), *(u32*)(HJ_SM_BASE + 0x2dc), *(short*)(HJ_SM_BASE + 0x638),
+            (*(u32*)0x0024D860) ? *(int*)((*(u32*)0x0024D860) + 0x14) : -1,
+            *(u8*)(HJ_SM_BASE + 0x168), *(u8*)(HJ_SM_BASE + 0x169), *(u32*)(HJ_SM_BASE + 0x2ec),
+            *(u8*)0x001A7118, (void*)gs, gs ? gs->PlayerCount : -1,
+            gs ? gs->PlayerStates[0] : -9, gs ? gs->PlayerStates[1] : -9,
+            gs ? gs->PlayerClients[0] : -9, gs ? gs->PlayerClients[1] : -9, isInMenus());
+    }
+    return internal_hjBackout(a0);
+}
+
+void hjInstallBackoutProbe(void)   // same re-arm rule as hjInstallLeaveActionProbe
+{
+    int n = 0;
+    if (!isInMenus()) return;
+    if (*(u32*)HJ_BACKOUT_A == HJ_BACKOUT_CALL) { HOOK_JAL(HJ_BACKOUT_A, &hjBackoutHook); ++n; }
+    if (*(u32*)HJ_BACKOUT_B == HJ_BACKOUT_CALL) { HOOK_JAL(HJ_BACKOUT_B, &hjBackoutHook); ++n; }
+    if (*(u32*)HJ_BACKOUT_C == HJ_BACKOUT_CALL) { HOOK_JAL(HJ_BACKOUT_C, &hjBackoutHook); ++n; }
+    if (*(u32*)HJ_BACKOUT_D == HJ_BACKOUT_CALL) { HOOK_JAL(HJ_BACKOUT_D, &hjBackoutHook); ++n; }
+    if (*(u32*)HJ_BACKOUT_E == HJ_BACKOUT_CALL) { HOOK_JAL(HJ_BACKOUT_E, &hjBackoutHook); ++n; }
+    if (n) HOTJOIN_LOG("backout: hooked %d of 5 sites\n", n);
+}
+
 void hjInstallPlayerBitGuard(void)
 {
     if (hjPlayerBitInstalled)
@@ -1739,6 +2978,37 @@ void hjInstallPlayerBitGuard(void)
     HOOK_JAL(HJ_DISCONNECT_SITE_D, &hjPeerConnectReqHook);
     HOOK_JAL(HJ_MARKCONN_SITE, &hjMarkConnectedHook);
 
+    hjInstallDestroyProbe();
+    hjInstallConnectCompleteHook();
+
+    if (*(u32*)HJ_LEAVE_SLOT == HJ_LEAVE_ORIG) {
+        hjLeaveOrig = *(u32*)HJ_LEAVE_SLOT;
+        POKE_U32(HJ_LEAVE_SLOT, &hjLeaveSessionHook);
+        HOTJOIN_LOG("leave: hooked slot %08x\n", HJ_LEAVE_SLOT);
+    } else {
+        HOTJOIN_LOG("leave: slot %08x holds %08x, expected %08x -- NOT hooked\n",
+            HJ_LEAVE_SLOT, *(u32*)HJ_LEAVE_SLOT, HJ_LEAVE_ORIG);
+    }
+
+    if (*(u32*)HJ_SESSEND_SLOT == HJ_SESSEND_ORIG) {
+        hjSessEndOrig = *(u32*)HJ_SESSEND_SLOT;
+        POKE_U32(HJ_SESSEND_SLOT, &hjSessionEndHook);
+        HOTJOIN_LOG("sessend: hooked slot %08x\n", HJ_SESSEND_SLOT);
+    } else {
+        HOTJOIN_LOG("sessend: slot %08x holds %08x, expected %08x -- NOT hooked\n",
+            HJ_SESSEND_SLOT, *(u32*)HJ_SESSEND_SLOT, HJ_SESSEND_ORIG);
+    }
+
+    if (*(u32*)HJ_PEERCLOSE_SITE_A == HJ_PEERCLOSE_CALL &&
+        *(u32*)HJ_PEERCLOSE_SITE_B == HJ_PEERCLOSE_CALL) {
+        HOOK_JAL(HJ_PEERCLOSE_SITE_A, &hjPeerCloseHook);
+        HOOK_JAL(HJ_PEERCLOSE_SITE_B, &hjPeerCloseHook);
+        HOTJOIN_LOG("peerclose: hooked both sites (14d0e0, 150310)\n");
+    } else {
+        HOTJOIN_LOG("peerclose: sites hold %08x/%08x, expected %08x -- NOT hooked\n",
+            *(u32*)HJ_PEERCLOSE_SITE_A, *(u32*)HJ_PEERCLOSE_SITE_B, HJ_PEERCLOSE_CALL);
+    }
+
     if (*(u32*)HJ_INTRO_SLOT == HJ_INTRO_ORIG) {
         POKE_U32(HJ_INTRO_SLOT, &hjIntroducePeerHook);
         HOTJOIN_LOG("introduce hook installed at slot %08x\n", HJ_INTRO_SLOT);
@@ -1774,6 +3044,13 @@ void hjLogEpochTock(void) { }
 void hjDumpPeers(void) { }
 void hjInstallType22Probe(void) { }
 void hjRefreshPeerActivity(void) { }
+void hjInstallLeaveCallerProbe(void) { }
+void hjInstallLeaveActionProbe(void) { }
+void hjInstallBackoutProbe(void) { }
+void hjInstallErrorLatchProbe(void) { }
+void hjWatchLatch(void) { }
+void hjRestoreStateMachine(void) { }
+void hjWatchStateMachine(void) { }
 #endif
 #define HOTJOIN_LOG_MAX_FRAMES      (240)
 
