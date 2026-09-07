@@ -252,10 +252,18 @@ void hjRegisterPlayerBit(void * a0, void * a1, int playerIndex)
     // Identify what this object is on a join where it exists. The first word of a
     // PS2 C++ object is its vtable pointer, which we can look up in the overlay to
     // name the class -- that tells us exactly which structure a hotjoiner is missing.
-    if (!hjPlayerBitSeen) {
-        hjPlayerBitSeen = 1;
-        HOTJOIN_LOG("playerbit: OK obj=%08x idx=%d id=%d ra=%08x\n",
-            obj, idx, playerIndex, (u32)__builtin_return_address(0));
+    // Log on the first sighting AND whenever the object for a slot changes. This
+    // used to be a hard one-shot, which made a rejoin look like the handler had
+    // stopped running when in fact it was only the log that had stopped. Do not
+    // read absence of this line as absence of the call.
+    {
+        static u32 lastObj[HJ_PLAYERBIT_TABLE_MAXIDX];
+        if (!hjPlayerBitSeen || lastObj[idx] != obj) {
+            hjPlayerBitSeen = 1;
+            lastObj[idx] = obj;
+            HOTJOIN_LOG("playerbit: OK obj=%08x idx=%d id=%d ra=%08x\n",
+                obj, idx, playerIndex, (u32)__builtin_return_address(0));
+        }
     }
 
     *(u32*)(obj + 0x7C) |= (1 << playerIndex);
@@ -1313,6 +1321,23 @@ static int hjRosterBeat = 0;
 int hjSpawned = 0;
 int hjAdopted = 0;                 // bitmask of slots we have already written
 
+// The tNW_Player array, needed here as well as further down. Identical redefinition
+// is legal C; the authoritative comments on these live with hjDumpNWPlayers.
+#define HJ_NWPLAYER_BASE   (0x0022F550)
+#define HJ_NWPLAYER_STRIDE (0xC70)
+#define HJ_NW_SEQ          (0xc34)
+
+// Slots reaped and not yet proven to have come back, plus the tNW_Player sequence
+// each held at the moment it was reaped. See hjHostAdoptPeers for why.
+int hjReapBlocked = 0;
+int hjReapBlockFrames[GAME_MAX_PLAYERS];
+
+// Per-slot: the tNW_Player pad sequence at the moment the slot was reaped, and a
+// bit saying we have not yet seen it move. Consumed by hjHostSpawnRemotes.
+int hjSpawnBlocked = 0;
+int hjSpawnSeq[GAME_MAX_PLAYERS];
+#define HJ_REAP_BLOCK_MAX  (900)   // 15 s, then adopt anyway rather than hang
+
 void hjHostAdoptPeers(void)
 {
     GameSettings * gs = gameGetSettings();
@@ -1321,6 +1346,8 @@ void hjHostAdoptPeers(void)
 
     if (isInMenus()) {
         hjAdopted = 0;      // rearm, so a retry is a clean run
+        hjReapBlocked = 0;
+        hjSpawnBlocked = 0;
         return;
     }
     if (!gs)
@@ -1357,10 +1384,48 @@ void hjHostAdoptPeers(void)
             continue;
         if (hjAdopted & (1 << i))                 // write once per slot, not per frame
             continue;
+
+        // (Re-adoption of a just-reaped slot is gated below, after the peer lookup.)
+
         if (gs->PlayerClients[i] >= 0)            // already present
             continue;
 
         p = internal_hjPeerLookup((void*)peers, i);
+
+        // Do not re-adopt a slot we just reaped until the OLD peer record is gone.
+        //
+        // Without a gate the reaper cleared the adopt bit outright, and because a
+        // departing peer lingers at state 5, this loop re-claimed the slot on the
+        // next frame and hjHostSpawnRemotes rebuilt the player -- a destroy/recreate
+        // cycle against a live player (reap 112.9456 -> adopt 112.9620 -> spawn
+        // 112.9637). That is what made the remote's weapon moby alternate with NULL.
+        //
+        // The first attempt gated on the pad sequence advancing, which DEADLOCKED:
+        // the sequence cannot advance until the joiner is in game, and the joiner
+        // cannot get in game until the host adopts it. Measured: "blocked until seq
+        // moves off 2" with no unblock, ever, and the joiner stuck on "waiting for
+        // players". Never gate an admission step on evidence that only exists after
+        // admission.
+        //
+        // The peer record does not have that problem: the stale one is torn down
+        // independently of anything we do, and a genuine rejoin brings a fresh one
+        // back to state 5. So wait for it to leave 5 (or disappear) once.
+        if (hjReapBlocked & (1 << i)) {
+            if (!p || *(int*)((u32)p + 0x08) != 5) {
+                hjReapBlocked &= ~(1 << i);
+                HOTJOIN_LOG("adopt: slot %d unblocked, stale peer cleared (p=%08x)\n",
+                    i, (u32)p);
+            } else if (++hjReapBlockFrames[i] < HJ_REAP_BLOCK_MAX) {
+                continue;                        // still the record we reaped
+            } else {
+                // Belt and braces. A gate that can never open is worse than the
+                // churn it prevents -- this file has now produced one of those.
+                hjReapBlocked &= ~(1 << i);
+                HOTJOIN_LOG("adopt: slot %d unblocked on timeout after %d frames\n",
+                    i, hjReapBlockFrames[i]);
+            }
+        }
+
         if (!p || *(int*)((u32)p + 0x08) != 5)    // only fully-connected peers
             continue;
 
@@ -1369,13 +1434,16 @@ void hjHostAdoptPeers(void)
         gs->PlayerTeams[i]   = 0;
         gs->PlayerSkins[i]   = 0;
         gs->PlayerTypes[i]   = 0;
-        {
-            /* placeholder name; the real one is in the 00-0F announce we do not parse yet */
-            const char * nm = "Hotjoiner";
-            int k;
-            for (k = 0; k < 16; ++k)
-                gs->PlayerNames[i][k] = (k < 9) ? nm[k] : 0;
-        }
+        // Deliberately DO NOT write a name here. The placeholder that used to live at
+        // this line round-tripped: the host wrote "Hotjoiner", its periodic settings
+        // broadcast carried that to the joiner (the broadcast is not the single-target
+        // path DME injects the real name into), the joiner then registered ITSELF under
+        // it, and the host read it straight back out of the registration. Measured: a
+        // namescan of the host's tNW_Player found 'Hotjoiner' at nwp[1]+0x1b0 while the
+        // host's OWN entry nwp[0] had no name at all -- proof that +0x1b0 is filled from
+        // the network, not from our roster, so any placeholder we invent here comes back
+        // to us as if it were real. hjHostRefreshNames below copies the name the joiner
+        // actually registered under.
         gs->PlayerCount = count + 1;
         hjAdopted |= (1 << i);
         HOTJOIN_LOG("adopt: host wrote roster slot %d (client %d, state %d), n -> %d\n",
@@ -1474,6 +1542,574 @@ void hjDumpNWPlayers(void)
 #define HJ_NW_CBCALLED    (0x1a6)
 #define HJ_NW_SEQ         (0xc34)
 #define HJ_NW_BUFFERED    (0xc38)
+
+// hjHostRefreshNames -- take the joiner's name from its own registration.
+//
+// tNW_Player carries the registering client's name at +0x1b0. Established by a
+// scan of the host's entries: slot 1 held the name the joiner registered under
+// while slot 0, the host's own, held nothing -- so the field is written from the
+// received registration and never from the local roster.
+//
+// The registration can land before or after hjHostAdoptPeers claims the slot, so
+// this runs every frame and copies whenever the roster disagrees, rather than once
+// at adopt time. Guarded on a printable, NUL-terminated string so a slot that is
+// not yet populated leaves the roster alone instead of writing garbage into it.
+#define HJ_NW_NAME  (0x1b0)
+
+void hjHostRefreshNames(void)
+{
+    GameSettings * gs;
+    int i, me;
+
+    if (isInMenus() || !isInGame() || !gameAmIHost())
+        return;
+
+    gs = gameGetSettings();
+    if (!gs)
+        return;
+    me = gameGetMyClientId();
+
+    for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
+        u32 nm = HJ_NWPLAYER_BASE + (i * HJ_NWPLAYER_STRIDE) + HJ_NW_NAME;
+        int k, len = -1, differs = 0;
+
+        if (i == me || gs->PlayerClients[i] < 0)
+            continue;
+
+        for (k = 0; k < 16; ++k) {
+            unsigned char c = *(unsigned char*)(nm + k);
+            if (c == 0) { len = k; break; }
+            if (c < 0x20 || c > 0x7e) break;
+        }
+        if (len <= 0)                     // empty, unterminated, or non-printable
+            continue;
+
+        for (k = 0; k < 16; ++k)
+            if (gs->PlayerNames[i][k] != *(char*)(nm + k)) { differs = 1; break; }
+        if (!differs)
+            continue;
+
+        for (k = 0; k < 16; ++k)
+            gs->PlayerNames[i][k] = (k < len) ? *(char*)(nm + k) : 0;
+
+        HOTJOIN_LOG("name: roster slot %d -> '%s' (from nwp +0x%x)\n",
+            i, gs->PlayerNames[i], HJ_NW_NAME);
+    }
+}
+
+// Hotjoin: the joiner tells the host its name.
+//
+// CORRECTION to the previous reading of nwp+0x1b0. A second scan, on a build with
+// the "Hotjoiner" placeholder removed, showed:
+//
+//     namescan: slot 0 ... nwp +0x1b0 'Luka77'      <- the HOST's own name
+//     namescan: slot 1 ... no name at all           <- the joiner, roster correct
+//
+// The first scan had happened to catch slot 0 before its name was set, and that
+// one empty reading was the whole basis for concluding the field is written from
+// the network. It is not: +0x1b0 mirrors the local roster. It held 'Hotjoiner'
+// only because we had put 'Hotjoiner' in the roster ourselves. With the roster
+// entry blank it stays blank, so it can never be a SOURCE for a name the host does
+// not already have. hjHostRefreshNames is kept -- it is correct and harmless, and
+// it is what applies the name once something supplies one -- but it was never
+// going to fix this on its own.
+//
+// The host has no local source for a joiner's name, so the joiner has to send it.
+// This uses the existing client-to-client channel over the DME connection (the same
+// one ping.c and the flag-pickup request use), not a new protocol.
+//
+// The joiner's own name is correct in its roster because DME injects it into the
+// snapshot (section 67), but the host's blank name can propagate back over the
+// host's settings broadcast -- so latch the first non-empty name seen and keep
+// sending that, rather than re-reading a field that may have been blanked.
+#define CUSTOM_MSG_ID_HOTJOIN_NAME  (32)
+#define HJ_NAME_SENDS               (30)   // ~30 s, once a second
+
+typedef struct HjNameMsg {
+    int  clientIdx;
+    char name[16];
+} HjNameMsg_t;
+
+static char hjMyName[16];
+static int  hjMyNameValid = 0;
+static int  hjNameSends = 0;
+static int  hjNameTick = 0;
+
+int hjOnRemoteName(void * connection, void * data)
+{
+    HjNameMsg_t msg;
+    GameSettings * gs;
+    int k, len = -1;
+
+    memcpy(&msg, data, sizeof(msg));
+
+    gs = gameGetSettings();
+    if (!gs || msg.clientIdx < 0 || msg.clientIdx >= GAME_MAX_PLAYERS)
+        return sizeof(HjNameMsg_t);
+
+    // Validate before writing into the roster: printable and NUL-terminated.
+    for (k = 0; k < 16; ++k) {
+        unsigned char c = (unsigned char)msg.name[k];
+        if (c == 0) { len = k; break; }
+        if (c < 0x20 || c > 0x7e) break;
+    }
+    if (len <= 0)
+        return sizeof(HjNameMsg_t);
+
+    for (k = 0; k < 16; ++k)
+        if (gs->PlayerNames[msg.clientIdx][k] != msg.name[k]) break;
+    if (k == 16)
+        return sizeof(HjNameMsg_t);      // already correct
+
+    for (k = 0; k < 16; ++k)
+        gs->PlayerNames[msg.clientIdx][k] = (k < len) ? msg.name[k] : 0;
+
+    HOTJOIN_LOG("name: slot %d -> '%s' (from client %d)\n",
+        msg.clientIdx, gs->PlayerNames[msg.clientIdx], msg.clientIdx);
+    return sizeof(HjNameMsg_t);
+}
+
+void hjSendMyName(void)
+{
+    GameSettings * gs;
+    void * conn;
+    HjNameMsg_t msg;
+    int me, k;
+
+    // Latch in MENUS too, and never clear the latched name.
+    //
+    // The first cut only looked once in game and cleared the latch on every menu
+    // transition, which can deadlock: the host starts with a blank name for the
+    // joiner, its settings broadcast blanks the joiner's own slot, the joiner then
+    // has nothing to latch, so it never tells the host and both stay blank for the
+    // whole match. Measured: "name: cannot latch -- me=1 bytes 00 00 00 00" on a run
+    // where DME had injected "Gtr4" correctly (server log confirms it for that very
+    // join). It worked the other times only because the joiner happened to look
+    // before the host's broadcast landed -- a race, not a design.
+    //
+    // Staging is where the injected snapshot is freshest, so look there as well. An
+    // account name does not change within a boot, so once latched it stays.
+    gs = gameGetSettings();
+    if (!gs)
+        return;
+
+    // Resolve our roster slot properly rather than indexing by client id: the two
+    // coincide for a hotjoiner today, but patchStaging already searches for it and
+    // this should not quietly depend on them staying equal.
+    {
+        int cid = gameGetMyClientId();
+        me = -1;
+        for (k = 0; k < GAME_MAX_PLAYERS; ++k)
+            if (gs->PlayerClients[k] == cid) { me = k; break; }
+    }
+    if (me < 0)
+        return;
+
+    // Latch the name the first time it reads as something real.
+    if (!hjMyNameValid) {
+        unsigned char c = (unsigned char)gs->PlayerNames[me][0];
+        if (c < 0x20 || c > 0x7e) {
+            // Say so, once. The previous build produced no name traffic at all and
+            // no log line either, which left three candidate causes (not called,
+            // wrong slot, empty name) indistinguishable. Never guess which gate
+            // closed when one line can name it.
+            static int moaned = 0;
+            if (!moaned) {
+                moaned = 1;
+                HOTJOIN_LOG("name: cannot latch -- me=%d bytes %02x %02x %02x %02x\n",
+                    me, (unsigned char)gs->PlayerNames[me][0],
+                    (unsigned char)gs->PlayerNames[me][1],
+                    (unsigned char)gs->PlayerNames[me][2],
+                    (unsigned char)gs->PlayerNames[me][3]);
+            }
+            return;
+        }
+        for (k = 0; k < 16; ++k)
+            hjMyName[k] = gs->PlayerNames[me][k];
+        hjMyNameValid = 1;
+        HOTJOIN_LOG("name: latched my own name '%s' (slot %d)\n", hjMyName, me);
+    }
+
+    // Rearm the send budget on the way back to menus -- but NOT the latched name,
+    // which is the whole point of the change above. Without this a second match in
+    // one boot would find the budget spent and never announce.
+    if (isInMenus()) {
+        hjNameSends = 0;
+        hjNameTick = 0;
+        return;
+    }
+
+    // Sending is still in-game, joiner-only, and budgeted.
+    if (!isInGame() || gameAmIHost() || hjNameSends >= HJ_NAME_SENDS)
+        return;
+
+    if (++hjNameTick < 60)
+        return;
+    hjNameTick = 0;
+
+    conn = netGetDmeServerConnection();
+    if (!conn)
+        return;
+
+    msg.clientIdx = me;
+    for (k = 0; k < 16; ++k)
+        msg.name[k] = hjMyName[k];
+
+    // Repeat rather than send once: the host may not have adopted the slot yet, and
+    // a single lost message would leave the name blank for the whole match.
+    netSendCustomAppMessage(conn, gameGetHostId(), CUSTOM_MSG_ID_HOTJOIN_NAME,
+        sizeof(msg), &msg);
+    ++hjNameSends;
+}
+
+void hjInstallNameHandler(void)
+{
+    // Every frame, NOT once. netInstallCustomMsgHandler also (re)installs the hook
+    // into DME_CALLBACK_TABLE and the Medius app-handler jump, and those live in
+    // game memory that is rewritten across a level load -- which is why ping.c calls
+    // this from its per-frame update too. Installing once at boot registered the
+    // handler into a table that was later replaced: the joiner latched and sent its
+    // name every second (log: "latched my own name 'Gtr4' (slot 1)") and the host
+    // never dispatched a single one.
+    netInstallCustomMsgHandler(CUSTOM_MSG_ID_HOTJOIN_NAME, &hjOnRemoteName);
+}
+
+// hjFindRemoteName -- where the joiner's account name lives on the host.
+//
+// The host writes the literal "Hotjoiner" into its roster slot when it adopts a
+// peer, because when that code was written nothing on the host was known to carry
+// the real name. That placeholder then propagates: the host's periodic settings
+// broadcast is NOT the single-target path DME injects into, so the joiner receives
+// "Hotjoiner" back and displays it over the correct name the server had already
+// injected into its first snapshot.
+//
+// Fixing it server-side alone cannot work for the host's own screen -- the host
+// never receives its own roster back -- so the host has to learn the name. It now
+// DOES receive the joiner's tNW_Player registration (server trace: "broadcast to 1
+// of 2 00-04 (236 bytes) from 1"), and 236 bytes is roomy enough to carry a name.
+// No tNW_Player struct definition exists in the decomp or in libuya, so this finds
+// the offset empirically rather than guessing: one scan per slot for printable
+// ASCII runs, in the tNW_Player entry and in the tNW_PlayerData it points at. Once
+// the offset is known this is replaced by a direct read.
+static u32 hjNameScanned = 0;
+
+static void hjScanAscii(const char * what, u32 base, int len)
+{
+    int i = 0;
+    int hits = 0;
+
+    while (i < len && hits < 8) {
+        int j = i;
+        while (j < len) {
+            unsigned char c = *(unsigned char*)(base + j);
+            if (c < 0x20 || c > 0x7e) break;
+            ++j;
+        }
+        if (j - i >= 4) {
+            char buf[33];
+            int k, n = (j - i) > 32 ? 32 : (j - i);
+            for (k = 0; k < n; ++k) buf[k] = *(char*)(base + i + k);
+            buf[n] = 0;
+            HOTJOIN_LOG("namescan: %s +0x%03x '%s'\n", what, i, buf);
+            ++hits;
+        }
+        i = (j > i) ? j : (i + 1);
+    }
+}
+
+void hjFindRemoteName(void)
+{
+    int i;
+
+    if (isInMenus()) { hjNameScanned = 0; return; }
+    if (!isInGame() || !gameAmIHost())
+        return;
+
+    for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
+        u32 nwp = HJ_NWPLAYER_BASE + (i * HJ_NWPLAYER_STRIDE);
+        u32 pData;
+
+        if (hjNameScanned & (1 << i))            continue;
+        if (*(int*)(nwp + HJ_NW_CID) < 0)        continue;
+        pData = *(u32*)(nwp + HJ_NW_PDATA);
+        if (!pData)                              continue;
+
+        hjNameScanned |= (1 << i);
+        HOTJOIN_LOG("namescan: slot %d nwp=%08x pData=%08x\n", i, nwp, pData);
+        // The entry is a known 0xC70 stride so scanning it is safe; stop short of the
+        // pad ring at 0xC30. pData is a heap object of unknown size -- 0x100 is the
+        // same window the settings blob uses, so do not widen it without evidence.
+        hjScanAscii("nwp", nwp, 0xC00);
+        hjScanAscii("pdata", pData, 0x100);
+    }
+}
+
+// hjDumpWeaponMask -- is a hot-joined remote stuck on the default loadout?
+//
+// playerSyncRemoteWeaponInventory (Metropolis 0x005292c0) runs every remote frame
+// and applies the inventory from
+//
+//     *(u16*)( *(u32*)( *(u32*)(player + 0x2558) + 4 ) + 0x80 )
+//
+// player+0x2558 is pNetPlayer, +4 is pNetPlayerData -- the same pData this file
+// already tracks -- so the mask is a u16 at pData+0x80. The function itself is
+// obfuscated (vaPlayerObfuscateWeaponAddr), but its INPUT is not, and the input is
+// what tells us whether the inventory is wrong or merely applied late.
+//
+// The theory, which the N60 observation motivates: a remote is constructed with the
+// default loadout, and the real inventory only arrives on a weapon-change event the
+// joiner was not present for. That predicts the host reads a default-looking mask
+// for the joiner (N60 = the default index, so the low bit set and little else)
+// while the joiner reads its true mask for itself, and the two converge only when
+// the owner switches weapons. Both machines log this, so the two views can be
+// compared directly on one timeline.
+//
+// If instead the mask is correct on both sides all along, the inventory is not the
+// problem and the delay is in applying it -- which would send this back to the
+// obfuscated consumer.
+#define HJ_PDATA_WEAPONMASK  (0x80)
+
+static u32 hjWmLastSig = 0;
+static int hjWmSamples = 0;
+
+void hjDumpWeaponMask(void)
+{
+    u32 sig = 0;
+    int i;
+
+    if (isInMenus() || !isInGame()) { hjWmLastSig = 0; hjWmSamples = 0; return; }
+    if (hjWmSamples >= 200)
+        return;
+
+    for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
+        u32 nwp = HJ_NWPLAYER_BASE + (i * HJ_NWPLAYER_STRIDE);
+        u32 pd  = *(u32*)(nwp + HJ_NW_PDATA);
+        if (*(int*)(nwp + HJ_NW_CID) < 0 || !pd)
+            continue;
+        sig = (sig * 31) + (u32)*(unsigned short*)(pd + HJ_PDATA_WEAPONMASK)
+            + (u32)(i << 24);
+    }
+    if (sig == hjWmLastSig)          // edge-triggered: a stuck mask prints once
+        return;
+    hjWmLastSig = sig;
+    ++hjWmSamples;
+
+    for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
+        u32 nwp = HJ_NWPLAYER_BASE + (i * HJ_NWPLAYER_STRIDE);
+        u32 pd  = *(u32*)(nwp + HJ_NW_PDATA);
+        int cid = *(int*)(nwp + HJ_NW_CID);
+        if (cid < 0 || !pd)
+            continue;
+        HOTJOIN_LOG("wmask: [%d] cid=%d local=%d pData=%08x mask=%04x\n",
+            i, cid, (int)*(char*)(nwp + HJ_NW_BLOCAL), pd,
+            (int)*(unsigned short*)(pd + HJ_PDATA_WEAPONMASK));
+    }
+}
+
+// hjDumpWeaponSlots -- the per-player weapon mobys.
+//
+// pData+0x80 was NOT the per-player inventory. Measured on both machines with a
+// 3-weapon match (blitz, flux, N60): mask=c80e on the host AND the joiner, and
+// identical for every player, converging from 0000 within ~0.6 s on the joiner and
+// ~3 s on the host on every rejoin, with no progressive widening. That is the
+// match weapon SET, not what a player is holding. The read chain in section 74 was
+// right and the interpretation was wrong.
+//
+// The per-player state is one level down. playerDeleteWeaponMobySlots walks SIX
+// slots at stride 0x50 in the Player struct, and playerUpdateWeaponMobySlotRemote
+// drives a slot from the remote pad buttons:
+//
+//     if (padCtx->0x1a0 & *(u32*)(&player->field_0x460 + slot*0x50))
+//         (&player->field_0x458)[slot*0x50] = 1;
+//
+// so per slot: +0x450 weapon moby, +0x454 a second moby, +0x458 the active flag,
+// +0x460 the button mask that fires it. A remote that cannot shoot but whose pad
+// stream is healthy (section 72) and whose weapon set is correct (above) would look
+// exactly like a slot whose moby is NULL or whose mask is 0.
+//
+// The N60 evidence predicts one populated slot and the rest empty until something
+// seeds them. 0x450 is inferred from the 0x454/0x458/0x460 cluster and the 0x50
+// stride, not confirmed -- if it prints nonsense, that is the field to doubt first.
+#define HJ_WS_MOBY    (0x450)
+#define HJ_WS_MOBY2   (0x454)
+#define HJ_WS_ACTIVE  (0x458)
+#define HJ_WS_MASK    (0x460)
+#define HJ_WS_STRIDE  (0x50)
+#define HJ_WS_SLOTS   (6)
+
+static u32 hjWsLastSig = 0;
+static int hjWsSamples = 0;
+
+void hjDumpWeaponSlots(void)
+{
+    Player ** all;
+    u32 sig = 0;
+    int i, k;
+
+    if (isInMenus() || !isInGame()) { hjWsLastSig = 0; hjWsSamples = 0; return; }
+    if (hjWsSamples >= 200)
+        return;
+
+    all = playerGetAll();
+    if (!all)
+        return;
+
+    for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
+        if (!all[i]) continue;
+        for (k = 0; k < HJ_WS_SLOTS; ++k) {
+            u32 b = (u32)all[i] + (k * HJ_WS_STRIDE);
+            sig = (sig * 31) + (*(u32*)(b + HJ_WS_MOBY) ? 1u : 0u)
+                + ((u32)*(unsigned char*)(b + HJ_WS_ACTIVE) << 1)
+                + (*(u32*)(b + HJ_WS_MASK) ? 4u : 0u);
+        }
+    }
+    if (sig == hjWsLastSig)
+        return;
+    hjWsLastSig = sig;
+    ++hjWsSamples;
+
+    for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
+        if (!all[i]) continue;
+        HOTJOIN_LOG("wslot: [%d] p=%08x moby=%08x %08x %08x %08x %08x %08x\n",
+            i, (u32)all[i],
+            *(u32*)((u32)all[i] + 0*HJ_WS_STRIDE + HJ_WS_MOBY),
+            *(u32*)((u32)all[i] + 1*HJ_WS_STRIDE + HJ_WS_MOBY),
+            *(u32*)((u32)all[i] + 2*HJ_WS_STRIDE + HJ_WS_MOBY),
+            *(u32*)((u32)all[i] + 3*HJ_WS_STRIDE + HJ_WS_MOBY),
+            *(u32*)((u32)all[i] + 4*HJ_WS_STRIDE + HJ_WS_MOBY),
+            *(u32*)((u32)all[i] + 5*HJ_WS_STRIDE + HJ_WS_MOBY));
+        HOTJOIN_LOG("wslot: [%d] act=%d%d%d%d%d%d mask=%08x %08x %08x %08x %08x %08x\n",
+            i,
+            (int)*(unsigned char*)((u32)all[i] + 0*HJ_WS_STRIDE + HJ_WS_ACTIVE),
+            (int)*(unsigned char*)((u32)all[i] + 1*HJ_WS_STRIDE + HJ_WS_ACTIVE),
+            (int)*(unsigned char*)((u32)all[i] + 2*HJ_WS_STRIDE + HJ_WS_ACTIVE),
+            (int)*(unsigned char*)((u32)all[i] + 3*HJ_WS_STRIDE + HJ_WS_ACTIVE),
+            (int)*(unsigned char*)((u32)all[i] + 4*HJ_WS_STRIDE + HJ_WS_ACTIVE),
+            (int)*(unsigned char*)((u32)all[i] + 5*HJ_WS_STRIDE + HJ_WS_ACTIVE),
+            *(u32*)((u32)all[i] + 0*HJ_WS_STRIDE + HJ_WS_MASK),
+            *(u32*)((u32)all[i] + 1*HJ_WS_STRIDE + HJ_WS_MASK),
+            *(u32*)((u32)all[i] + 2*HJ_WS_STRIDE + HJ_WS_MASK),
+            *(u32*)((u32)all[i] + 3*HJ_WS_STRIDE + HJ_WS_MASK),
+            *(u32*)((u32)all[i] + 4*HJ_WS_STRIDE + HJ_WS_MASK),
+            *(u32*)((u32)all[i] + 5*HJ_WS_STRIDE + HJ_WS_MASK));
+    }
+}
+
+// hjDumpPadRing -- why a hot-joiner sees the host's actions late.
+//
+// Remote players replay a jitter-buffered pad stream. Ghidra names the fields on
+// tNW_Player, and the base exe's ring advance is 0x0019b5b8, reached only from the
+// tail of playerConsumeRemoteStatePacket (overlay 0x005284b8):
+//
+//   activePadFrame++;  if (activePadFrame == 4) { advance(pNetPlayer); ... }
+//
+// so one ring entry is retired per 4 remote frames -- 15/s, matching the sender.
+// The advance pops one entry, and pops a SECOND when the catch-up flag (+0xc40) is
+// set. That flag has hysteresis around jitterThrottleFrames * 0.25:
+//
+//   set   when buffered > thr*0.25 + 4
+//   clear when buffered < thr*0.25 + 3
+//
+// With thr=2 that is a steady state of 3-4 entries, which is exactly where a settled
+// stream sits in the logs. But right after a hot-join the joiner's buffer climbs to
+// 15-16 -- about a second of lag at 15/s, which is the reported late-shot symptom --
+// and takes the better part of a minute to come down. With catch-up engaged it should
+// drain 15 entries/s, i.e. in well under a second, so something is stopping the
+// advance from running at all.
+//
+// The prime suspect is the gate at the TOP of the consumer, which returns before
+// activePadFrame is ever incremented:
+//
+//   if (pActivePadMsg == NULL ||
+//       (numConsecutiveSkips != 0 && now - lastPadMsgReceiveTick < jitterThrottleFrames))
+//       return;
+//
+// numConsecutiveSkips is incremented by the enqueue path (0x0019b544) every time two
+// pad messages land less than 600 ticks apart, and reset when they do not. A joiner
+// coming out of a level load receives its backlog as a burst, which is precisely the
+// condition that runs that counter up.
+//
+// This probe does not fix anything. It samples the whole tuple once a second so the
+// next capture says which term is actually stuck -- guessing between "catch-up never
+// engages", "the consumer is never called", and "the ring is simply full" would mean
+// patching a jitter buffer blind.
+#define HJ_PR_DECODEPOS   (0xc30)
+#define HJ_PR_ACTIVEFRAME (0xc31)
+#define HJ_PR_BUFFERED    (0xc38)
+#define HJ_PR_LASTTICK    (0xc3c)
+#define HJ_PR_CATCHUP     (0xc40)
+#define HJ_PR_THROTTLE    (0xc41)
+#define HJ_PR_SKIPS       (0xc42)
+#define HJ_PR_ACTIVEMSG   (0xc44)
+#define HJ_NET_TICK       (0x002412ac)
+
+static int hjPrTick = 0;
+static int hjPrSamples = 0;
+static u32 hjPrLastSig = 0;
+
+void hjDumpPadRing(void)
+{
+    int i;
+
+    if (isInMenus() || !isInGame()) {
+        hjPrTick = 0; hjPrSamples = 0; hjPrLastSig = 0;
+        return;
+    }
+    if (++hjPrTick < 60)          // 1 Hz -- per-frame probes perturb join timing
+        return;
+    hjPrTick = 0;
+    if (hjPrSamples >= 120)       // ~2 minutes, then stop logging entirely
+        return;
+
+    // Only speak when something moved. A first cut logged two lines a second for
+    // the whole join regardless, and the run that produced was a hard failure --
+    // the joiner never exchanged a pad packet at all. That failure is not
+    // attributable to this probe (it only reads), but log volume during a join has
+    // cost us before, so the steady state here is silence.
+    {
+        u32 sig = 0;
+        for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
+            u32 n = HJ_NWPLAYER_BASE + (i * HJ_NWPLAYER_STRIDE);
+            sig = (sig * 31) + (u32)*(int*)(n + HJ_PR_BUFFERED)
+                + (u32)*(unsigned char*)(n + HJ_PR_CATCHUP)
+                + (u32)*(unsigned char*)(n + HJ_PR_SKIPS)
+                + (u32)*(signed char*)(n + HJ_PR_THROTTLE);
+        }
+        if (sig == hjPrLastSig)
+            return;
+        hjPrLastSig = sig;
+    }
+    ++hjPrSamples;
+
+    for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
+        u32 nwp = HJ_NWPLAYER_BASE + (i * HJ_NWPLAYER_STRIDE);
+        int cid = *(int*)(nwp + HJ_NW_CID);
+        int buffered, thr, skips, catchup, lastTick, now, gate;
+
+        // Only remote slots have a ring; a local one never buffers.
+        if (cid < 0 || *(u32*)(nwp + HJ_NW_PDATA) == 0 || *(char*)(nwp + HJ_NW_BLOCAL))
+            continue;
+
+        buffered = *(int*)(nwp + HJ_PR_BUFFERED);
+        thr      = (int)*(signed char*)(nwp + HJ_PR_THROTTLE);
+        skips    = (int)*(unsigned char*)(nwp + HJ_PR_SKIPS);
+        catchup  = (int)*(unsigned char*)(nwp + HJ_PR_CATCHUP);
+        lastTick = *(int*)(nwp + HJ_PR_LASTTICK);
+        now      = *(int*)HJ_NET_TICK;
+
+        // The consumer's own gate, evaluated the way the overlay evaluates it.
+        gate = (*(u32*)(nwp + HJ_PR_ACTIVEMSG) != 0)
+            && (skips == 0 || (now - lastTick) >= thr);
+
+        HOTJOIN_LOG("padring: [%d] cid=%d buffered=%d frame=%d catchup=%d thr=%d "
+            "skips=%d dTick=%d gate=%d msg=%08x\n",
+            i, cid, buffered,
+            (int)*(unsigned char*)(nwp + HJ_PR_ACTIVEFRAME),
+            catchup, thr, skips, now - lastTick, gate,
+            *(u32*)(nwp + HJ_PR_ACTIVEMSG));
+    }
+}
+
 // 8 seconds at 60fps. A pad stream runs at ~15/s, so this is ~120 missed
 // messages -- far beyond any lag spike, but still well inside the window
 // before a returning player tries to rejoin.
@@ -1532,6 +2168,43 @@ void hjHostReapRemotes(void)
 
         HOTJOIN_LOG("reap: nwp[%d] %08x cid=%d seq=%d stalled %d frames -> deleting\n",
             i, nwp, cid, seq, stallFrames[i]);
+
+        // Does the vanilla teardown have anything to match on?
+        //
+        // playerDeleteRemoteForSession (Metropolis 0x0052aba0) is ONE guarded block:
+        // it walks the player array for a Player whose pNetPlayer (+0x2558) equals
+        // the tNW_Player being deleted, and only inside that match does it queue the
+        // "%s has left the game." message AND free the weapon moby slots, delete the
+        // player moby, clear the array slot, migrate abandoned object owners and call
+        // guberMobyHandlePlayerLeft. No match means none of it runs.
+        //
+        // The message has never been seen in a non-vanilla join. The per-index byte
+        // at 0x001a6625 suppresses only the MESSAGE (not the cleanup) once it reads
+        // 2, and this function is the only known writer of it -- so on a fresh boot
+        // the first leave should emit. That points at "no match", i.e. the whole
+        // teardown being skipped, which would explain weapon state degrading across
+        // successive rejoins. But "only known writer" is an assumption, so log the
+        // byte as well as the match rather than trusting the deduction.
+        {
+            Player ** all = playerGetAll();
+            int k, matched = -1;
+
+            if (all) {
+                for (k = 0; k < GAME_MAX_PLAYERS; ++k) {
+                    if (!all[k])
+                        continue;
+                    if (*(u32*)((u32)all[k] + 0x2558) == nwp)
+                        matched = k;
+                    HOTJOIN_LOG("reap: player[%d]=%08x pNetPlayer=%08x f1a14=%d msgflag=%d\n",
+                        k, (u32)all[k], *(u32*)((u32)all[k] + 0x2558),
+                        (int)*(char*)((u32)all[k] + 0x1a14),
+                        (int)*(unsigned char*)(0x001a6625 + k));
+                }
+            }
+            HOTJOIN_LOG("reap: nwp=%08x match=%d (-1 means the vanilla teardown will "
+                "find nothing and skip every step)\n", nwp, matched);
+        }
+
         internal_hjDeleteRemotePlayer((void*)nwp);
         HOTJOIN_LOG("reap: nwp[%d] after: cid=%d spawned=%d cbCalled=%d\n",
             i, *(int*)(nwp + HJ_NW_CID),
@@ -1569,7 +2242,34 @@ void hjHostReapRemotes(void)
                     ++n;
             gs->PlayerCount = n;
             hjAdopted &= ~(1 << cid);
-            HOTJOIN_LOG("reap: roster slot %d cleared, n -> %d, adopt bit rearmed\n",
+            // Rearm, but blocked until this slot sees fresh pad traffic.
+            hjReapBlocked |= (1 << cid);
+            hjReapBlockFrames[cid] = 0;
+            hjSpawnBlocked |= (1 << cid);
+            hjSpawnSeq[cid] = seq;
+
+            // Release the slot's stale registration.
+            //
+            // 0x00199A40 clears netClientIndex but deliberately LEAVES
+            // pNetPlayerData. Measured across a rejoin: nwp[1] keeps cid=-1 and the
+            // identical pData (01f7b8c0, the first life's pointer) for the whole
+            // session, and its pad sequence never advances again -- so nothing ever
+            // re-initialises the slot for the returning client, and the only reason
+            // earlier builds showed a player at all is that they spawned from that
+            // dead pointer (section 79, which froze the host).
+            //
+            // Leaving the pointer is right for vanilla, where the slot belongs to a
+            // session that is going away with it. It is wrong for reuse. Clearing it
+            // is what lets the registration path treat a returning client as new.
+            // Only the SLOT's reference is cleared -- the object itself is owned by
+            // the net layer and is not freed here.
+            HOTJOIN_LOG("reap: clearing nwp[%d] pData=%08x seq=%d for re-registration\n",
+                cid, *(u32*)(nwp + HJ_NW_PDATA), *(int*)(nwp + HJ_NW_SEQ));
+            *(u32*)(nwp + HJ_NW_PDATA) = 0;
+            *(int*)(nwp + HJ_NW_SEQ) = 0;
+            hjSpawnSeq[cid] = 0;
+            HOTJOIN_LOG("reap: roster slot %d cleared, n -> %d, adopt rearmed "
+                "(blocked until the stale peer record clears; seq was %d)\n",
                 cid, gs->PlayerCount);
         }
 
@@ -1697,16 +2397,51 @@ void hjHostSpawnRemotes(void)
         // this slot and the data pointer is live, put the index back and let the vanilla
         // invoker below do the real work. This is the same shape as the roster adopt,
         // one level down.
+        // Same caveat as the spawn gate below: after a reap the pData here is the
+        // previous life's, so do not repair the index until the stream proves a new
+        // one exists.
         if (*(int*)(nwp + 0x00) < 0 && *(u32*)(nwp + 0x04) != 0
+            && !(hjSpawnBlocked & (1 << i))
             && gs && gs->PlayerClients[i] == i) {
             *(int*)(nwp + 0x00) = i;
-            HOTJOIN_LOG("respawn: nwp[%d] cid -1 -> %d from roster (pData=%08x)\n",
+            // bSpawned too. 0x199A40 clears +0x1a2 on delete and 0x1999B8 sets only
+            // +0x1a6 (bCallbackCalled), so a repaired slot would sit at spawned=0
+            // forever -- and hjHostReapRemotes skips any slot with !spawned, resetting
+            // its stall counter every frame. Measured: the first leave reaped correctly,
+            // the second never did, and nwp[1] sat at seq=213 unchanged for 90 s with
+            // the departed player still in the world. The reused Player object then
+            // appears to teleport when the next joiner takes the slot.
+            *(short*)(nwp + HJ_NW_SPAWNED) = 1;
+            HOTJOIN_LOG("respawn: nwp[%d] cid -1 -> %d, spawned -> 1 (pData=%08x)\n",
                 i, i, *(u32*)(nwp + 0x04));
         }
 
         if (*(int*)(nwp + 0x00) < 0)       continue;   // no client in this slot
         if (*(short*)(nwp + 0x1a6) != 0)   continue;   // callback already ran
         if (*(u32*)(nwp + 0x04) == 0)      continue;   // no tNW_PlayerData
+
+        // ...but a non-NULL pData is NOT proof of a live registration on a REJOIN.
+        // 0x00199A40 deliberately leaves pNetPlayerData intact when it deletes, so
+        // after a reap this gate is already satisfied by the previous life's
+        // pointer and the spawn fires the instant the slot is re-adopted. Measured:
+        //     first join   adopt 74.55 -> spawn 82.99   (8.4 s, pData really arrives)
+        //     rejoin       adopt 111.1774 -> spawn 111.1824  (5 ms, stale pData)
+        //     and the pad seq read 147 at BOTH reaps -- it never advanced, so the
+        //     second life never streamed anything at all.
+        // Building a remote player out of that is what froze the host.
+        //
+        // The honest signal that a new life exists is the pad sequence moving off
+        // what it held at reap time. Unlike the adopt gate of section 78 this does
+        // NOT deadlock: adoption still happens, the roster still reaches the joiner,
+        // and the joiner streams as soon as it is in game -- which is exactly the
+        // 8 s the first join takes anyway.
+        if (hjSpawnBlocked & (1 << i)) {
+            if (*(int*)(nwp + HJ_NW_SEQ) == hjSpawnSeq[i])
+                continue;
+            hjSpawnBlocked &= ~(1 << i);
+            HOTJOIN_LOG("spawn: slot %d unblocked, seq moved %d -> %d\n",
+                i, hjSpawnSeq[i], *(int*)(nwp + HJ_NW_SEQ));
+        }
 
 
         hjSpawned |= (1 << i);
@@ -1760,6 +2495,25 @@ void hjDumpRoster(void)
         gs->PlayerTeams[4], gs->PlayerTeams[5], gs->PlayerTeams[6], gs->PlayerTeams[7],
         gs->PlayerTypes[0], gs->PlayerTypes[1], gs->PlayerTypes[2], gs->PlayerTypes[3],
         gs->PlayerTypes[4], gs->PlayerTypes[5], gs->PlayerTypes[6], gs->PlayerTypes[7]);
+
+    // Names, on both machines. Three builds have now argued about who holds which
+    // name without either side ever printing what it actually has -- the roster is
+    // the thing both the display and the outgoing registration read from, so print
+    // it. Copied into a terminated buffer first: PlayerNames entries are a fixed 16
+    // bytes and are not guaranteed to contain a NUL.
+    {
+        char nb[GAME_MAX_PLAYERS][17];
+        int k;
+        for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
+            for (k = 0; k < 16; ++k) {
+                unsigned char c = (unsigned char)gs->PlayerNames[i][k];
+                nb[i][k] = (c >= 0x20 && c <= 0x7e) ? (char)c : (c ? '?' : 0);
+                if (!c) break;
+            }
+            nb[i][16] = 0;
+        }
+        HOTJOIN_LOG("roster: names  ='%s' '%s' '%s' '%s'\n", nb[0], nb[1], nb[2], nb[3]);
+    }
 }
 
 static int hjPeerWasInMenus = 0;
@@ -3039,7 +3793,14 @@ void hjDumpNWPlayers(void) { }
 void hjHostSpawnRemotes(void) { }
 void hjHostReapRemotes(void) { }
 void hjDumpPadStream(void) { }
+void hjDumpPadRing(void) { }
+void hjDumpWeaponMask(void) { }
+void hjDumpWeaponSlots(void) { }
+void hjFindRemoteName(void) { }
+void hjSendMyName(void) { }
+void hjInstallNameHandler(void) { }
 void hjHostAdoptPeers(void) { }
+void hjHostRefreshNames(void) { }
 void hjLogEpochTock(void) { }
 void hjDumpPeers(void) { }
 void hjInstallType22Probe(void) { }
