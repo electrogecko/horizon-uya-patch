@@ -3066,14 +3066,24 @@ int main(void)
 	hjHostReapRemotes();
 	hjDumpPadStream();
 	hjDumpPadRing();
-	hjDumpWeaponMask();
-	hjDumpWeaponSlots();
+	// RETIRED 2026-09-12. Both belonged to the weapon investigation of sections
+	// 76-77, which concluded the weapon bug was never a weapon bug (it was reap/adopt
+	// churn). They were the single largest source of log volume -- 444 wslot lines in
+	// a capture that held only 58 padstream lines -- and per-frame instrumentation is
+	// recorded in this repo as having materially degraded join reliability. Re-enable
+	// deliberately if a weapon-specific question comes back.
+	// hjDumpWeaponMask();
+	// hjDumpWeaponSlots();
 	hjFindRemoteName();
 	hjDumpDispatch();
 	hjWatchStateMachine();
 	hjRestoreStateMachine();
 	hjInstallLeaveCallerProbe();
-	hjWatchLatch();
+	// RETIRED 2026-09-12. This existed to settle whether event 12 was a stale latch
+	// or a transient race (section 58). It proved the latter and the question is
+	// closed, but it kept firing ~30 times a second on a field that toggles 0 <-> 7
+	// every frame, which is noise with no consumer.
+	// hjWatchLatch();
 	hjInstallErrorLatchProbe();
 	hjInstallLeaveActionProbe();
 	hjInstallBackoutProbe();

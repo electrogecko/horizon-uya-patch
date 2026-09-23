@@ -193,6 +193,7 @@ extern int internal_hjResolvePlayerCtx(void ** out, void * arg);
 extern void internal_hjPeerConnectCtor(void * a0, void * a1);
 extern void * internal_hjPeerLookup(void * peers, int idx);
 extern int internal_hjIntroducePeer(void * ctx, int peerIdx, int a2, int a3);
+extern void * internal_hjAuxGet(void * ctx, int peerIdx);   // 0x14a490
 
 static int hjPlayerBitInstalled = 0;
 static int hjPlayerBitSkips = 0;
@@ -315,6 +316,12 @@ void hjRegisterPlayerBit(void * a0, void * a1, int playerIndex)
 #define HJ_NET_CLOCK_PTR  (0x001A1CB8)
 #define HJ_CTX_LAST_ACT   (0xE4)
 #define HJ_CTX_PEERS      (0xE8)
+// peers+0x404 = my own peer index; peers+0x408 = the index of the machine allowed to
+// run introducePeer (0x00173FC0 returns immediately unless the two are equal). Defined
+// here rather than beside the type-22 hook because hjIntroducePeerHook, which is
+// earlier in the file, reads them too.
+#define HJ_PEERS_MYIDX    (0x404)
+#define HJ_PEERS_INTRO    (0x408)
 #define HJ_CLOCK_NOW      (0x50)
 
 #define HJ_DISCONNECT_SITE_A  (0x0014f19c)
@@ -1326,6 +1333,7 @@ int hjAdopted = 0;                 // bitmask of slots we have already written
 #define HJ_NWPLAYER_BASE   (0x0022F550)
 #define HJ_NWPLAYER_STRIDE (0xC70)
 #define HJ_NW_SEQ          (0xc34)
+#define HJ_NW_PDATA        (0x04)
 
 // Slots reaped and not yet proven to have come back, plus the tNW_Player sequence
 // each held at the moment it was reaped. See hjHostAdoptPeers for why.
@@ -1337,6 +1345,92 @@ int hjReapBlockFrames[GAME_MAX_PLAYERS];
 int hjSpawnBlocked = 0;
 int hjSpawnSeq[GAME_MAX_PLAYERS];
 #define HJ_REAP_BLOCK_MAX  (900)   // 15 s, then adopt anyway rather than hang
+
+// Identical redefinitions, same reason as the block above: these are needed here as
+// well as beside hjDumpNWPlayers, and the reaper lives 800 lines further down.
+#define HJ_NW_CID          (0x00)
+#define HJ_NW_SPAWNED      (0x1a2)
+#define HJ_NW_CBCALLED     (0x1a6)
+
+extern void internal_hjDeleteRemotePlayer(void * nwp);   // 0x199a40
+
+// ---------------------------------------------------------------------------
+// hjReleaseRemoteSlot -- the ONE teardown, shared by both paths that free a slot.
+//
+// This function exists because the two paths drifted apart and the divergence was the
+// bug, twice. The stall-driven reaper (hjHostReapRemotes) had the complete sequence; a
+// roster-driven rearm added in hjHostAdoptPeers on 2026-09-11 reimplemented most of it
+// by hand, omitted two steps, and produced a hard regression in which only the first
+// late join ever spawned. Reverting that rearm then exposed the opposite failure: with
+// nothing clearing the latches on a clean leave, the rejoin never got adopted at all.
+//
+// Measured, agent hosting, 2026-09-12. Clean leave at 325.54 (sessend msg=3,
+// peerclose t08=2) with NO reap line anywhere in the run, then the rejoin:
+//
+//     347.48  introduce  p404=0 p408=0 ret=1040296128     <- the introduce is FIXED
+//     no adopt line, no spawn line, for 105+ s
+//     nwp[1]  cid=1 pData=01f7b680 (new) bSpawned=1 cbCalled=0 padSeq=-1
+//
+// So the engine re-registered the slot on its own, and both of OUR latches were still
+// set from the first join: hjAdopted made hjHostAdoptPeers skip the roster write (it is
+// write-once per slot) and hjSpawned made hjHostSpawnRemotes skip the slot before it
+// even reached the sequence gate. padSeq stuck at the -1 sentinel is downstream of
+// that, not a separate fault -- with PlayerClients[1] still -1 the host has no reason
+// to take the joiner's pad stream. The first join proves the ordering:
+// adopt 184.16 -> pads flow -> spawn 194.86.
+//
+// Both latches, or neither. Clearing hjAdopted alone regresses to "adopt then nothing";
+// clearing hjSpawned alone leaves the roster wrong.
+//
+// The delete invoker is conditional on cbCalled, which is our own marker that 0x1999b8
+// ran. With it clear there is no constructed player to destroy, and calling 0x199A40
+// anyway risks tearing down a registration that has already come back -- exactly the
+// race this path runs into, since it fires within ~50 ms of the session end.
+// ---------------------------------------------------------------------------
+void hjReleaseRemoteSlot(int cid, GameSettings * gs, const char * why)
+{
+    u32 nwp;
+    int k, n = 0;
+
+    if (cid < 0 || cid >= GAME_MAX_PLAYERS)
+        return;
+    nwp = HJ_NWPLAYER_BASE + (cid * HJ_NWPLAYER_STRIDE);
+
+    HOTJOIN_LOG("release: slot %d (%s) cid=%d pData=%08x spawned=%d cbCalled=%d seq=%d\n",
+        cid, why, *(int*)(nwp + HJ_NW_CID), *(u32*)(nwp + HJ_NW_PDATA),
+        (int)*(short*)(nwp + HJ_NW_SPAWNED), (int)*(short*)(nwp + HJ_NW_CBCALLED),
+        *(int*)(nwp + HJ_NW_SEQ));
+
+    if (*(short*)(nwp + HJ_NW_CBCALLED))
+        internal_hjDeleteRemotePlayer((void*)nwp);
+
+    hjSpawned &= ~(1 << cid);
+    hjAdopted &= ~(1 << cid);
+
+    hjReapBlocked |= (1 << cid);
+    hjReapBlockFrames[cid] = 0;
+    hjSpawnBlocked |= (1 << cid);
+    hjSpawnSeq[cid] = 0;
+
+    if (gs) {
+        gs->PlayerClients[cid] = -1;
+        gs->PlayerStates[cid]  = 0;
+        gs->PlayerTeams[cid]   = -1;
+        gs->PlayerSkins[cid]   = 0;
+        gs->PlayerTypes[cid]   = 0;
+        for (k = 0; k < 16; ++k)
+            gs->PlayerNames[cid][k] = 0;
+        for (k = 0; k < GAME_MAX_PLAYERS; ++k)
+            if (gs->PlayerClients[k] >= 0)
+                ++n;
+        gs->PlayerCount = n;
+    }
+
+    *(u32*)(nwp + HJ_NW_PDATA) = 0;
+    *(int*)(nwp + HJ_NW_SEQ) = 0;
+
+    HOTJOIN_LOG("release: slot %d done, n -> %d, adopt+spawn latches rearmed\n", cid, n);
+}
 
 void hjHostAdoptPeers(void)
 {
@@ -1382,6 +1476,30 @@ void hjHostAdoptPeers(void)
         void * p;
         if (i == *(int*)(peers + 0x404))          // skip ourselves
             continue;
+        // REARM ON A CLEAN LEAVE, via the shared teardown.
+        //
+        // Third attempt at this, and the history matters because the first two failed in
+        // opposite directions:
+        //
+        //   09-11  a hand-written rearm here cleared hjAdopted but not hjSpawned, so
+        //          rejoins were adopted and then skipped forever by hjHostSpawnRemotes
+        //          -- "adopt then nothing", only the first join ever spawned
+        //   09-12  reverting it removed the only thing that cleared hjAdopted on a clean
+        //          leave, so rejoins were never adopted at all -- introduce succeeded,
+        //          roster stayed PlayerClients[1] = -1, no pads, no spawn
+        //
+        // Both were the same underlying defect: two code paths freeing one slot, with
+        // only one of them complete. hjReleaseRemoteSlot is now the single definition and
+        // both callers use it, so they cannot disagree again.
+        //
+        // The roster is the authority on whether a slot is free, and it is the right
+        // trigger rather than "which teardown won the race": the stall-driven reaper does
+        // not fire on a clean leave at all (measured -- sessend msg=3, peerclose t08=2,
+        // and no reap line anywhere in a run with three leaves), so keying on our own
+        // reaper is keying on the path that does not happen.
+        if ((hjAdopted & (1 << i)) && gs->PlayerClients[i] < 0)
+            hjReleaseRemoteSlot(i, gs, "roster freed the slot");
+
         if (hjAdopted & (1 << i))                 // write once per slot, not per frame
             continue;
 
@@ -1475,20 +1593,35 @@ void hjDumpNWPlayers(void)
     u32 sig = 0;
     int i;
 
-    for (i = 0; i < 2; ++i) {
+    for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
         u32 p = HJ_NWPLAYER_BASE + (i * HJ_NWPLAYER_STRIDE);
         sig = (sig * 31) + *(u32*)(p + 0x00) + *(u32*)(p + 0x04)
             + (u32)*(short*)(p + 0x1a2) + (u32)*(short*)(p + 0x1a6)
             + (u32)*(unsigned char*)(p + 0x68)
             + *(u32*)(p + 0xc34) + *(u32*)(p + 0xc38) + *(u32*)(p + 0xc44);
     }
+    // Cap stays at 20. This is NOT a lifetime budget -- hjLogEpochTock rearms
+    // hjNwDumps every epoch, so it sets a SUSTAINED line rate. Raising it to 60
+    // while also widening the loop from 2 slots to 8 multiplied this probe's
+    // output by about twelve, and it measured 31.3 of the host's 39.2 HJ lines
+    // per second -- 80% of all log traffic. printf to the EE console is not free,
+    // and per-frame instrumentation has already taken this game's join success
+    // from 2 tries to 9 once before. Widening the loop was necessary for three
+    // players; raising the cap was not, and the two went out in the same build as
+    // a behaviour fix, which is exactly the bundling that costs us runs.
     if (sig == hjLastNwSig || hjNwDumps > 20)
         return;
     hjLastNwSig = sig;
     ++hjNwDumps;
 
-    for (i = 0; i < 2; ++i) {
+    for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
         u32 p = HJ_NWPLAYER_BASE + (i * HJ_NWPLAYER_STRIDE);
+        // Occupied slots only. An empty slot prints two lines of zeroes that say
+        // nothing; in a 3-player game this is 6 lines per dump instead of 16, and
+        // it keeps the cost proportional to the players actually in the match
+        // rather than to GAME_MAX_PLAYERS.
+        if (*(int*)(p + 0x00) < 0 && *(u32*)(p + 0x04) == 0)
+            continue;
         HOTJOIN_LOG("nwp: [%d] %08x cid=%d pData=%08x flags=%08x bLocal=%d spawned=%d cbCalled=%d\n",
             i, p,
             *(int*)(p + 0x00), *(u32*)(p + 0x04), *(u32*)(p + 0x14),
@@ -2155,9 +2288,27 @@ void hjHostReapRemotes(void)
             continue;
         }
 
-        // seq == 0 means this client has never sent a pad message: it is still
+        // seq <= 0 means this client has never sent a pad message: it is still
         // arriving, not leaving. Reaping there would kill a joiner mid-join.
-        if (seq == 0 || seq != lastSeq[i] || buffered > 0) {
+        //
+        // BOTH non-positive values mean "nothing has arrived yet", and the test
+        // has to cover both or it eats the second one:
+        //    0  -- no remote stream expected yet (fresh slot)
+        //   -1  -- registered, nothing ever arrived (re-registration sentinel)
+        // The -1 is not hypothetical: hjHostSpawnRemotes logs "seq moved 0 -> -1"
+        // on every spawn, so a slot sits at -1 from the instant it is admitted
+        // until the first pad lands. With only the == 0 exemption, -1 == lastSeq
+        // on the next frame, stallFrames climbs, and at HJ_REAP_FRAMES the slot is
+        // reaped -- then rearmed, respawned back to -1, and reaped again.
+        // Measured 2026-09-23 on a userver/mbpubuntu two-client match: 26 releases
+        // and 36 spawns in a ~2 minute loop, cycling every ~10s, ending only when
+        // pads finally began arriving. The joiner was invisible to the host for
+        // 2m16s of a 6 minute match.
+        //
+        // This is the same error as the spawn-gate deadlock of section 89, mirrored:
+        // that one gated ADMISSION on evidence only available after admission, this
+        // one gates EVICTION on evidence that has not had time to appear yet.
+        if (seq <= 0 || seq != lastSeq[i] || buffered > 0) {
             lastSeq[i] = seq;
             stallFrames[i] = 0;
             continue;
@@ -2205,73 +2356,10 @@ void hjHostReapRemotes(void)
                 "find nothing and skip every step)\n", nwp, matched);
         }
 
-        internal_hjDeleteRemotePlayer((void*)nwp);
-        HOTJOIN_LOG("reap: nwp[%d] after: cid=%d spawned=%d cbCalled=%d\n",
-            i, *(int*)(nwp + HJ_NW_CID),
-            (int)*(short*)(nwp + HJ_NW_SPAWNED),
-            (int)*(short*)(nwp + HJ_NW_CBCALLED));
-
-        // playerDeleteRemoteForSession clears the ENGINE state -- Player, moby,
-        // pointer-table slot -- but knows nothing about the Horizon roster slot,
-        // because we wrote that ourselves in hjHostAdoptPeers. Measured: after a
-        // successful reap the host still reported
-        //     roster: clients=0 1  states=8 8  n=2
-        //     plist: [1] NULL
-        // and a returning joiner's introduce stalled at "state 3 -> 3" forever.
-        // The host saw client 1 already present at state 8 (fully joined), so it
-        // never ran the admit sequence. Undo the adopt as well, and clear the
-        // write-once bit so a rejoin can be adopted again -- hjAdopted is only
-        // rearmed in menus, and an in-game host never goes there.
-        if (gs && cid >= 0 && cid < GAME_MAX_PLAYERS) {
-            int k, n = 0;
-            // Release our own per-slot latch too. Without this the slot is reaped and
-            // re-adopted correctly but hjHostSpawnRemotes still skips it forever on
-            // `hjSpawned & (1 << i)`, so the rejoining player is never reconstructed --
-            // measured as reap -> adopt -> nothing, with plist[1] NULL for the rest of
-            // the match.
-            hjSpawned &= ~(1 << cid);
-            gs->PlayerClients[cid] = -1;
-            gs->PlayerStates[cid]  = 0;
-            gs->PlayerTeams[cid]   = -1;
-            gs->PlayerSkins[cid]   = 0;
-            gs->PlayerTypes[cid]   = 0;
-            for (k = 0; k < 16; ++k)
-                gs->PlayerNames[cid][k] = 0;
-            for (k = 0; k < GAME_MAX_PLAYERS; ++k)
-                if (gs->PlayerClients[k] >= 0)
-                    ++n;
-            gs->PlayerCount = n;
-            hjAdopted &= ~(1 << cid);
-            // Rearm, but blocked until this slot sees fresh pad traffic.
-            hjReapBlocked |= (1 << cid);
-            hjReapBlockFrames[cid] = 0;
-            hjSpawnBlocked |= (1 << cid);
-            hjSpawnSeq[cid] = seq;
-
-            // Release the slot's stale registration.
-            //
-            // 0x00199A40 clears netClientIndex but deliberately LEAVES
-            // pNetPlayerData. Measured across a rejoin: nwp[1] keeps cid=-1 and the
-            // identical pData (01f7b8c0, the first life's pointer) for the whole
-            // session, and its pad sequence never advances again -- so nothing ever
-            // re-initialises the slot for the returning client, and the only reason
-            // earlier builds showed a player at all is that they spawned from that
-            // dead pointer (section 79, which froze the host).
-            //
-            // Leaving the pointer is right for vanilla, where the slot belongs to a
-            // session that is going away with it. It is wrong for reuse. Clearing it
-            // is what lets the registration path treat a returning client as new.
-            // Only the SLOT's reference is cleared -- the object itself is owned by
-            // the net layer and is not freed here.
-            HOTJOIN_LOG("reap: clearing nwp[%d] pData=%08x seq=%d for re-registration\n",
-                cid, *(u32*)(nwp + HJ_NW_PDATA), *(int*)(nwp + HJ_NW_SEQ));
-            *(u32*)(nwp + HJ_NW_PDATA) = 0;
-            *(int*)(nwp + HJ_NW_SEQ) = 0;
-            hjSpawnSeq[cid] = 0;
-            HOTJOIN_LOG("reap: roster slot %d cleared, n -> %d, adopt rearmed "
-                "(blocked until the stale peer record clears; seq was %d)\n",
-                cid, gs->PlayerCount);
-        }
+        // Everything this used to do inline now lives in hjReleaseRemoteSlot, which the
+        // roster-driven path in hjHostAdoptPeers calls as well. The two had drifted apart
+        // twice and each divergence was a shipped bug; see that function's comment.
+        hjReleaseRemoteSlot(cid, gs, "pad stall");
 
         stallFrames[i] = 0;
         lastSeq[i] = 0;
@@ -2368,7 +2456,26 @@ void hjHostSpawnRemotes(void)
     int i, me;
 
     if (isInMenus()) { hjSpawned = 0; return; }
-    if (!gameAmIHost() || !isInGame())
+
+    // NOT host-only. Building a remote Player is purely local object management --
+    // nothing in the loop below writes the roster or touches peer state, so every
+    // machine in the game needs to run it, not just the host.
+    //
+    // Measured with a third client hot-joining a 2-player match (host LuKa77 slot 0,
+    // in-game client maxTest1 slot 1, late joiner Gtr4 slot 2). Read out of the
+    // NON-HOST's EE memory:
+    //     GameSettings  clients=0 1 2, states=8 8 8, names ok, PlayerCount=3
+    //     tNW_Player[2] cid=2 pData=01f7c560 bSpawned=1 cbCalled=0 seq=-1
+    //     PlayerStructArray[2] = NULL
+    // i.e. the joiner was fully registered on the non-host and the roster was
+    // correct, but cbCalled=0 -- the vanilla construction callback never fired,
+    // exactly as it never fires on the host. The host got a body only because this
+    // function ran there. Slot 0 (the host) on that same machine reads cbCalled=1,
+    // because it was built the ordinary way at level load.
+    //
+    // So the host gate was never a safety property, just an artifact of having only
+    // ever tested two players.
+    if (!isInGame())
         return;
 
     all = playerGetAll();
@@ -2436,11 +2543,53 @@ void hjHostSpawnRemotes(void)
         // and the joiner streams as soon as it is in game -- which is exactly the
         // 8 s the first join takes anyway.
         if (hjSpawnBlocked & (1 << i)) {
-            if (*(int*)(nwp + HJ_NW_SEQ) == hjSpawnSeq[i])
+            // GATE ON RE-REGISTRATION, NOT ON PAD DATA.  Corrected 2026-09-12.
+            //
+            // The previous version required a positive sequence and rejected the -1
+            // sentinel, to stop a churn cycle seen with a paused emulator:
+            //     296.64 reap -> 297.04 unblocked (0 -> -1) -> spawn
+            //     305.04 reap -> 305.44 unblocked (0 -> -1) -> spawn   ... forever
+            // Its comment asserted "this cannot deadlock: the spawn is not an admission
+            // gate, so the joiner is still adopted and still streams". That assumption
+            // is false, and it is the whole remaining rejoin bug.
+            //
+            // Measured with the host clean and the joiner in-game, both sides verified
+            // by live EE memory:
+            //     joiner   in-game, padstream curFrame +60/s, seq +15/s, sees the host
+            //     host     peer1+0x08 = 5 (fully promoted), PlayerClients[1] = 1,
+            //              peers+0x404 = peers+0x408 = 0
+            //     host     nwp[1] cbCalled=0 padSeq=-1, ring tick FROZEN, act/tail NULL
+            // The joiner streams and the host accepts none of it, because the pad
+            // consumer has no Player object for the slot -- and the Player object is
+            // created by the spawn this gate is blocking. So:
+            //
+            //     spawn waits for pad data -> pad data needs a Player -> Player needs
+            //     the spawn
+            //
+            // A first join escapes it only because hjSpawnBlocked is never SET without a
+            // prior release, so the gate is skipped entirely; every rejoin is caught.
+            // That is exactly the error already written down twelve hundred lines up, in
+            // the reap-block comment: "Never gate an admission step on evidence that only
+            // exists after admission."
+            //
+            // So accept the sentinel. -1 means "re-registered, nothing received yet",
+            // which is precisely the evidence we want: the slot is live and new. Require
+            // the registration to be real as well, so this can never spawn from the
+            // previous life's dead pointer (section 79, which froze the host).
+            //
+            // The anti-churn protection does NOT come from here. It belongs to
+            // hjReapBlocked, which holds the re-adopt until the OLD peer record has left
+            // state 5 or disappeared -- peer identity, not payload, and the correct
+            // signal for "this is genuinely a new client". It worked this run, clearing
+            // 0.1 ms after the release because the stale record was already gone.
+            int seqNow = *(int*)(nwp + HJ_NW_SEQ);
+            if (*(int*)(nwp + HJ_NW_CID) != i || *(u32*)(nwp + HJ_NW_PDATA) == 0)
+                continue;
+            if (seqNow == hjSpawnSeq[i])
                 continue;
             hjSpawnBlocked &= ~(1 << i);
             HOTJOIN_LOG("spawn: slot %d unblocked, seq moved %d -> %d\n",
-                i, hjSpawnSeq[i], *(int*)(nwp + HJ_NW_SEQ));
+                i, hjSpawnSeq[i], seqNow);
         }
 
 
@@ -2635,6 +2784,7 @@ void hjDumpPeers(void)
 #define HJ_INTRO_ORIG    (0x00173fc0)
 
 static int hjIntroLogged = 0;
+static int hjP408Held = 0;
 
 int hjIntroducePeerHook(void * ctx, int peerIdx, int a2, int a3)
 {
@@ -2658,9 +2808,18 @@ int hjIntroducePeerHook(void * ctx, int peerIdx, int a2, int a3)
 
     if (hjIntroLogged < 24) {
         ++hjIntroLogged;
-        HOTJOIN_LOG("introduce: idx=%d ra=%08x a2=%08x a3=%08x state %d -> %d ret=%d\n",
+        // p408/p404 say whether the introducer gate (0x174038) let us through, and aux
+        // says whether the SECOND gate (0x17404c, "this peer already has an aux record")
+        // would refuse instead. Until section 84's latch, every rejoin died at the first
+        // gate and the second was never reached, so its state is still unmeasured.
+        // Both are read after the call, which is what the next attempt will see.
+        HOTJOIN_LOG("introduce: idx=%d ra=%08x a2=%08x a3=%08x state %d -> %d ret=%d "
+            "p404=%d p408=%d aux=%08x\n",
             peerIdx, (u32)__builtin_return_address(0), (u32)a2, (u32)a3,
-            before, after, ret);
+            before, after, ret,
+            peers ? *(int*)(peers + HJ_PEERS_MYIDX) : -1,
+            peers ? *(int*)(peers + HJ_PEERS_INTRO) : -1,
+            peers ? (u32)internal_hjAuxGet((void*)peers, peerIdx) : 0);
     }
     return ret;
 }
@@ -2723,6 +2882,13 @@ void hjLogEpochTock(void)
     hjEvLogged = 0;
     hjLatchLogged = 0;
     hjLatchWatchLogged = 0;
+    // FOURTH TIME. hjP408Held was a LIFETIME cap of 8, not an epoch budget, and the
+    // first join spent all 8. "ABSENT: HJ p408 on both rejoins" therefore meant "the
+    // budget was gone", and I read it as "the joiner never announced" -- while the
+    // joiner's own log showed 70 announces and a peer table with both records at
+    // state 5. Sections 63, 78 and 80 are the same mistake: a probe's own gating read
+    // as a property of the game. Every counter in this file belongs in this function.
+    hjP408Held = 0;
     // The player-array dump had the same one-shot cap as the others, and it cost us a
     // measurement: on the host it fired ONCE at 217.7s, six seconds BEFORE the roster
     // adopt at 223.98s, so the run that finally produced a matching roster on both
@@ -2734,6 +2900,72 @@ void hjLogEpochTock(void)
             hjT22Seen[t][p] = 0;
 }
 
+// ---------------------------------------------------------------------------
+// THE REJOIN ROOT CAUSE: our own announce disarms the host's introducer.
+//
+// 0x00173FC0 introducePeer opens with a gate that is easy to miss because none of its
+// exits load a return value -- every failure path falls through with whatever v0 last
+// held, so the value our probe prints as `ret` IS the thing that failed the test:
+//
+//     174000  jal 0x16f1e0        ; sp+16 = peers->0x408   (that function is a
+//                                 ;   two-line getter: *out = peers[0x408]; return 0)
+//     174030  lw   v0,16(sp)      ; v0 = peers->0x408
+//     174034  lw   v1,0x404(s3)   ; v1 = peers->0x404 = MY peer index
+//     174038  bnel v1,v0,0x174178 ; if (p404 != p408) return p408, introduce NOTHING
+//
+// peers->0x408 has exactly ONE runtime writer in the whole image -- 0x00171D20,
+// `sw a1,0x408(a0)`, reached only through 0x00171D18, which the type-22 handler
+// dispatches as ctx->0x44 for inbound message type 5:
+//
+//     150e3c  lbu a1,0(s1)        ; a1 = msg[0] = type
+//     150e48  sw  a1,8(s2)        ; peer->0x08 = type       (the useful half)
+//     150e5c  bne a1,5 -> skip
+//     150e68  lbu a1,1(s1)        ; msg[1] = the SENDER's peer index
+//     150e74  jalr ctx->0x44      ; peers->0x408 = sender index
+//
+// hjAnnounce sets our own record to 5 and calls 0x14bdb0 with target -1. That builds a
+// header whose msg[0] is the record's 0x08 (= 5) and whose msg[1] is our own index, and
+// broadcasts it to EVERY peer. So each announce tells every other machine
+// "peers->0x408 = the joiner", and nothing ever puts it back.
+//
+// Measured on both machines in the same session. Host LuKa77, me=0:
+//
+//     p408   0 -> 1 at 99.6 s (first joiner announces) -> 2 at 338.3 s (second)
+//     introduce  88.6  ret=1040296128   p408=0 == me   <- the gate PASSED, join worked
+//     introduce 299.9  ret=1            p408=1
+//     introduce 338.1  ret=1            p408=1
+//     introduce 570.6 .. 839.2  ret=2   p408=2         <- five rejoins, all refused
+//
+// ret equals p408 in all eight samples, and the single introduce that did real work is
+// the single one taken before any announce landed. Gtr4 shows the same correlation from
+// the other side: its introduce at 9490.81 returned 0 while p408 was still 0, p408
+// flipped to 2 at 9491.03, and every introduce from 9723 on returned 2.
+//
+// That is the whole "first hot-join works, every rejoin fails" symptom, and it is
+// self-inflicted: the comment on hjAnnounce notes we deliberately do NOT call 0x171d18
+// locally "because that overwrites peers->0x408, which on the joiner legitimately points
+// at the host" -- correct, but we then broadcast a message whose entire remote effect is
+// to make every other machine perform that exact write.
+//
+// THE GUARD. Once a machine's p408 equals its own p404 it is the introducer, and no
+// inbound announce may take that away. Restoring the pre-call value (rather than forcing
+// p404) keeps this to a pure undo of the damage:
+//
+//   host      p408 == p404 == 0, so the latch holds it at 0 and introduce works on
+//             every rejoin, not just the first
+//   non-host  p408 never equals p404 (it points at the host), the condition is never
+//             true, and not a single write is suppressed -- zero behaviour change
+//
+// The useful half of the type-5 -- `peer->0x08 = 5`, which is the whole reason
+// hjAnnounce exists -- happens at 150e48, BEFORE the branch, so it is untouched.
+//
+// UNVERIFIED: this is reasoned from the disassembly and from two logs that do not share
+// a clock. It predicts the host's p408 now stays 0 for the whole session and that
+// introduce stops returning a small index. If p408 still drifts, the write has a second
+// source this scan did not find and the scan (sw rt,0x408(base) over 0x140000-0x1b0000)
+// is the thing to widen.
+// ---------------------------------------------------------------------------
+
 int hjType22Hook(void * a0, void * a1, int a2, u8 * payload)
 {
     int (*orig)(void *, void *, int, u8 *) =
@@ -2741,8 +2973,28 @@ int hjType22Hook(void * a0, void * a1, int a2, u8 * payload)
     int msgType = payload ? payload[0] : -1;
     int peerIdx = payload ? payload[1] : -1;
     int ret;
+    u32 nc = *(u32*)HJ_NET_CTX_PTR;
+    u32 np = nc ? *(u32*)(nc + HJ_CTX_PEERS) : 0;
+    int wasIntro = 0, p408Before = 0;
+
+    // Snapshot before the handler runs: only a machine that already owns the introducer
+    // role has anything to defend.
+    if (np) {
+        p408Before = *(int*)(np + HJ_PEERS_INTRO);
+        wasIntro = (p408Before == *(int*)(np + HJ_PEERS_MYIDX));
+    }
 
     ret = orig(a0, a1, a2, payload);
+
+    if (wasIntro && np && *(int*)(np + HJ_PEERS_INTRO) != p408Before) {
+        int stolenBy = *(int*)(np + HJ_PEERS_INTRO);
+        *(int*)(np + HJ_PEERS_INTRO) = p408Before;
+        if (hjP408Held < 8) {
+            ++hjP408Held;
+            HOTJOIN_LOG("p408: held at %d -- type=%d from peer %d tried to take it to %d\n",
+                p408Before, msgType, peerIdx, stolenBy);
+        }
+    }
 
     // Budget per (msgType, peerIdx) pair, refilled by the log epoch below -- NOT one
     // global counter. A single global cap of 40 was silently fatal: the host burned all

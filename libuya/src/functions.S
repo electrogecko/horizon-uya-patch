@@ -410,6 +410,13 @@ FUNCTION(internal_hjCheckAllConnected, 0x00171d30)
 FUNCTION(internal_hjIntroducePeer, 0x00173fc0)
 FUNCTION(internal_hjMarkConnected, 0x00172898)
 FUNCTION(internal_hjSendPeerMsg, 0x0014bdb0)
+// The AUXILIARY peer table -- a 256-entry pointer array at *(u32*)0x001CCEA0,
+// separate from the main peer array. introducePeer refuses to run a second time
+// for a peer whose aux record still exists (0x174044 -> bnezl at 0x17404c), so a
+// rejoin needs this slot to have been freed by the close. The only per-index free
+// is inside 0x001725BC, which is table-dispatched and has no jal callers, so
+// whether it runs on a close is unproven -- hence the probe.
+FUNCTION(internal_hjAuxGet, 0x0014a490)
 // "spawn the remote player for this NWPlayer": loads the level-registered callback
 // from 0x002407D0 (set by vaInitNetworkedGameplaySystems via 0x001999a8 ->
 // playerCreateRemoteForSession), calls it, then sets p->bCallbackCalled (+0x1a6).
