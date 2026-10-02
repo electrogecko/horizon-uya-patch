@@ -406,10 +406,18 @@ FUNCTION(internal_hjBackout, 0x006d1928)
 FUNCTION(internal_hjEventCopy, 0x0014f298)
 FUNCTION(internal_hjSetErrorLatch, 0x0014ce48)
 FUNCTION(internal_hjPublishMyIndex, 0x00171d18)
+FUNCTION(internal_hjPromoteGate, 0x001725c0)
+FUNCTION(internal_hjS34Gate, 0x0016c710)
 FUNCTION(internal_hjCheckAllConnected, 0x00171d30)
 FUNCTION(internal_hjIntroducePeer, 0x00173fc0)
 FUNCTION(internal_hjMarkConnected, 0x00172898)
 FUNCTION(internal_hjSendPeerMsg, 0x0014bdb0)
+// The TYPE-9 handler: dispatch table[9], reached only through the table (slot
+// 0x001d88c4), which is why it has no jal callers. It holds the ONLY write of peer
+// state 4 in the net module, at 0x1509dc. Signature read off the prologue:
+//   a0 = peers, a1 = unused, a2 = peerIdx (bounds-checked < 256), a3 = message
+// Returns 8 on the success path AND on the ctx+0x108 early-out, -1 on every other bail.
+FUNCTION(internal_hjType9, 0x001508d0)
 // The AUXILIARY peer table -- a 256-entry pointer array at *(u32*)0x001CCEA0,
 // separate from the main peer array. introducePeer refuses to run a second time
 // for a peer whose aux record still exists (0x174044 -> bnezl at 0x17404c), so a

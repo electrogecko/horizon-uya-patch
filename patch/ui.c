@@ -152,6 +152,18 @@ extern mapOverrideResponse;
 // in the patch at 60fps. Remove once the in-game join path is understood.
 #define HOTJOIN_LOG(fmt, args...)   printf("HJ " fmt, ##args)
 
+// HJ_BUILD_TAG -- the build fingerprint, printed once at hook-install time.
+//
+// A test round was held up asking the emulator agents to confirm an md5, which they CANNOT
+// do: Horizon delivers the patch over the network straight into EE memory, so
+// patch-10684.bin never lands on a client's disk and there is nothing there to hash. Both
+// agents refused to guess rather than fake a match.
+//
+// Bump by hand for any build handed to a tester, and identify rounds by this string. An md5
+// still identifies a build on the SERVER machine, where the file exists and the bind mount
+// can be verified; the tag is the only identifier available on a client.
+#define HJ_BUILD_TAG   "20260929b-arm-latch-fix"
+
 // ---------------------------------------------------------------------------
 // Hotjoin: guard the per-player registration that faults for a late joiner.
 //
@@ -193,9 +205,11 @@ extern int internal_hjResolvePlayerCtx(void ** out, void * arg);
 extern void internal_hjPeerConnectCtor(void * a0, void * a1);
 extern void * internal_hjPeerLookup(void * peers, int idx);
 extern int internal_hjIntroducePeer(void * ctx, int peerIdx, int a2, int a3);
+extern int internal_hjType9(void * peers, int a1, int peerIdx, void * msg);
 extern void * internal_hjAuxGet(void * ctx, int peerIdx);   // 0x14a490
 
 static int hjPlayerBitInstalled = 0;
+static int hjPlayerBitNegIds = 0;
 static int hjPlayerBitSkips = 0;
 static int hjPlayerBitSeen = 0;
 
@@ -203,8 +217,35 @@ void hjRegisterPlayerBit(void * a0, void * a1, int playerIndex)
 {
     void * out = 0;
 
+    // playerIndex < 0 MUST be rejected, not just -2.   (s154, measured 2026-09-28)
+    // The final statement of this function is `obj->0x7C |= (1 << playerIndex)`. A
+    // negative shift is undefined in C, and on MIPS the shift amount is masked to 5
+    // bits, so playerIndex == -1 sets BIT 31 instead of any player's bit. Observed
+    // live on the host during a hot-join:
+    //     HJ playerbit: OK obj=01f7c1d0 idx=1 id=-1 ra=0016f2f0
+    // obj and idx were both correct -- it is only the id that was bogus -- so the
+    // registration "succeeded" while setting a garbage bit and leaving player 1's bit
+    // clear. That matches the symptom exactly: the host rendered maxTest2's NAMETAG but
+    // no character model and no radar blip.
+    // Returning early cannot lose a legitimate registration, because bit 31 was never
+    // the right bit for anybody. It is deliberately LOUD rather than silent: the -1 is
+    // an upstream defect and masking it quietly is how we would lose it.
     if (playerIndex == -2)
         return;
+    // REVERTED TO LOG-ONLY on 2026-09-28 (s154-A). I briefly returned early here, on the
+    // belief that `1 << -1` was a bug of mine. It is not: vanilla 0x00199c40 does the
+    // IDENTICAL shift with the IDENTICAL single `-2` guard (`sllv` masks to 5 bits exactly as
+    // C does), so refusing it was a DIVERGENCE from the game, not a fix. Measured across a
+    // round: it changed nothing visually -- still nametag-only, one radar blip -- so it bought
+    // no benefit either. Observe, do not diverge.
+    if (playerIndex < 0) {
+        if ((hjPlayerBitNegIds % 60) == 0)
+            HOTJOIN_LOG("playerbit: ANOMALY negative id=%d ra=%08x n=%d "
+                "-- vanilla shift APPLIED (sets bit 31)\n",
+                playerIndex, (u32)__builtin_return_address(0), hjPlayerBitNegIds);
+        ++hjPlayerBitNegIds;
+        /* fall through: do what vanilla does */
+    }
 
     if (internal_hjResolvePlayerCtx(&out, a1) != 0)
         return;
@@ -513,6 +554,8 @@ int hjSessEndLogged = 0;
 // a2/a3 are still live at the 0x14d0e0 call site: 0x14d098 only copies a0 into t0 and
 // branches on a2/a3 before it gets here, so nothing has clobbered them. a3 is 0 by the
 // branch condition; a2 is the one unknown worth reading.
+void hjPeerClosedRemote(int idx, int t08);   // defined with the teardown, ~800 lines down
+
 void hjPeerCloseHook(void * peers, int idx, int a2, int a3)
 {
     u32 ra = (u32)__builtin_return_address(0);
@@ -561,6 +604,11 @@ void hjPeerCloseHook(void * peers, int idx, int a2, int a3)
     }
 
     internal_hjPeerClose(peers, idx);
+
+    // AFTER the vanilla close, so its own disconnect callbacks have run and we tear down
+    // what they left behind rather than racing them. t08 was read above, before peerReset
+    // memsets the record.
+    hjPeerClosedRemote(idx, t08);
 }
 
 void hjPeerConnectReqHook(int idx)
@@ -1432,6 +1480,106 @@ void hjReleaseRemoteSlot(int cid, GameSettings * gs, const char * why)
     HOTJOIN_LOG("release: slot %d done, n -> %d, adopt+spawn latches rearmed\n", cid, n);
 }
 
+// ---------------------------------------------------------------------------
+// hjPeerClosedRemote -- the OFF-HOST teardown (sections 96, 101-A, 109).
+//
+// A non-host never destroys a departed remote player. At three players that leaves a ghost:
+// a live, frame-ticked moby with a HUD arrow over it. At two players with the HOST leaving
+// it strands the survivor -- measured: roster still [0,1], n=2, the host's player still
+// spawned with a live pData, and no teardown of any kind for as long as anyone watched.
+//
+// That is permanent BY CONSTRUCTION. Both existing triggers are unreachable off-host:
+//   roster-driven  hjHostAdoptPeers releases when the HOST writes PlayerClients[i] = -1.
+//                  When the host is the departing party, nobody is left to write it.
+//   stall-driven   hjHostReapRemotes returns immediately on !gameAmIHost().
+// peerclose is the one departure signal that does reach a non-host, its hook is already
+// installed on both call sites, and that hook is not host-gated. So trigger off it.
+//
+// EVERY CLAUSE OF THE FIRST VERSION OF THIS GATE WAS WRONG, and shipping it log-only is the
+// only reason we know. What the measurements corrected:
+//
+//   t08 == 5 REQUIRED  ->  REMOVED. Taken from an old note reading "close at t08=5, reap
+//     0.9 s later". Measured: a clean leave closes at t08 = 2 on BOTH roles (host ev=1,2;
+//     joiner ev=1). Requiring 5 meant this could never fire on the case it was written for.
+//     t08 is logged, never tested.
+//
+//   WHY REMOVING IT IS SAFE, the part that needs care: state 2 is ALSO the initialised
+//     state an ARRIVING peer passes through (0x17262c), and firing a teardown at an
+//     arriving peer is the section-89 mistake a third time. What separates arrival from
+//     departure is not the peer state -- it is whether a player has been CONSTRUCTED. An
+//     arriving peer has spawned=0, pData=0; a departing one has spawned=1 and a live pData.
+//     `spawned && pData` is the real discriminator and it was already here.
+//
+//   forceDelete, TO BEAT THE cbCalled GUARD  ->  DROPPED, and its premise was false. The
+//     claim was that only the host runs 0x1999b8, so a non-host's cbCalled stays 0 forever
+//     and the guard "reduces the teardown to a roster edit -- that IS the ghost". Measured
+//     on the joiner: cbCalled=1 while its log contains ZERO spawn, adopt or release lines.
+//     The ENGINE writes +0x1A6, not us. The guard passes on its own and needed no override,
+//     and the ghost is not caused by it -- it is caused by no trigger existing off-host.
+//
+// THE HOST EXCLUDES ITSELF WITH NO HOST GATE. Measured ordering on a host:
+//     1262.8511  release: slot 1 (roster freed the slot)
+//     1262.8855  peerclosed: idx=1 ... spawned=0 pData=00000000      <- 34 ms later
+// The roster path wins and has already cleared those fields, so this declines by itself.
+// Off-host they are still set and it fires. One rule, correct on both roles -- this file's
+// two historical teardown bugs were both caused by having two rules that drifted apart.
+//
+// STILL UNVERIFIED: this repairs the roster and the moby. It does NOT repair p408, which in
+// the host-leaves case still points at a departed peer. Whether the survivor becomes
+// joinable again, or merely stops rendering a corpse, is open. Do not report the stranded
+// client as fixed until a rejoin against a survivor has actually been observed.
+// ---------------------------------------------------------------------------
+static int hjPeerCloseReleases = 0;
+#define HJ_PEERCLOSE_MAX  (8)
+
+void hjPeerClosedRemote(int idx, int t08)
+{
+    GameSettings * gs = gameGetSettings();
+    u32 ctx   = *(u32*)HJ_NET_CTX_PTR;
+    u32 peers = ctx ? *(u32*)(ctx + HJ_CTX_PEERS) : 0;
+    u32 nwp;
+    int spawned, cbCalled, eligible;
+    u32 pData;
+
+    if (idx < 0 || idx >= GAME_MAX_PLAYERS)
+        return;
+
+    nwp      = HJ_NWPLAYER_BASE + (idx * HJ_NWPLAYER_STRIDE);
+    spawned  = (int)*(short*)(nwp + HJ_NW_SPAWNED);
+    pData    = *(u32*)(nwp + HJ_NW_PDATA);
+    cbCalled = (int)*(short*)(nwp + HJ_NW_CBCALLED);
+
+    eligible = spawned && pData && idx != gameGetMyClientId();
+
+    ++hjPeerCloseReleases;
+    HOTJOIN_LOG("peerclosed: idx=%d t08=%d host=%d p404=%d myCid=%d "
+        "nwp[%d] cid=%d pData=%08x spawned=%d cbCalled=%d seq=%d "
+        "roster=[%d,%d,%d,%d] n=%d elig=%d ev=%d\n",
+        idx, t08, gameAmIHost(),
+        peers ? *(int*)(peers + HJ_PEERS_MYIDX) : -1,
+        gameGetMyClientId(),
+        idx, *(int*)(nwp + HJ_NW_CID), pData, spawned, cbCalled,
+        *(int*)(nwp + HJ_NW_SEQ),
+        gs ? gs->PlayerClients[0] : -9, gs ? gs->PlayerClients[1] : -9,
+        gs ? gs->PlayerClients[2] : -9, gs ? gs->PlayerClients[3] : -9,
+        gs ? gs->PlayerCount : -9,
+        eligible, hjPeerCloseReleases);
+
+    if (!eligible)
+        return;
+
+    // Safety valve. An unbounded teardown is how this file once produced a destroy/recreate
+    // cycle against a live player. Eight is far more leaves than a test round needs and
+    // small enough that a runaway stops being silent.
+    if (hjPeerCloseReleases > HJ_PEERCLOSE_MAX) {
+        HOTJOIN_LOG("peerclosed: slot %d NOT released, cap %d reached\n",
+            idx, HJ_PEERCLOSE_MAX);
+        return;
+    }
+
+    hjReleaseRemoteSlot(idx, gs, "peer closed");
+}
+
 void hjHostAdoptPeers(void)
 {
     GameSettings * gs = gameGetSettings();
@@ -1539,7 +1687,8 @@ void hjHostAdoptPeers(void)
                 // Belt and braces. A gate that can never open is worse than the
                 // churn it prevents -- this file has now produced one of those.
                 hjReapBlocked &= ~(1 << i);
-                HOTJOIN_LOG("adopt: slot %d unblocked on timeout after %d frames\n",
+                HOTJOIN_LOG("adopt: slot %d ANOMALY unblocked on timeout after %d frames "
+                    "-- peer record outlived its teardown; a phantom re-adopt may follow\n",
                     i, hjReapBlockFrames[i]);
             }
         }
@@ -2191,7 +2340,17 @@ void hjDumpPadRing(void)
     if (++hjPrTick < 60)          // 1 Hz -- per-frame probes perturb join timing
         return;
     hjPrTick = 0;
-    if (hjPrSamples >= 120)       // ~2 minutes, then stop logging entirely
+    // 2026-09-25: was 120, which is why this probe went silent at t=920 in round
+    // 20260925a and stayed silent for the remaining 342 s of the session. That silence was
+    // then read as possible evidence that the joiner's pad ring had frozen and the reaper
+    // could not see it -- a bug that does not exist. It emitted exactly its quota and
+    // switched off.
+    //
+    // THIRD TIME AN ABSENCE OF LOG OUTPUT MISLED THIS PROJECT (after an anchored `^HJ`
+    // grep reporting zero lines in a log full of them, and a pad_seq snapshot read out of
+    // the middle of a reap loop). RULE: absence of a line is almost never evidence about
+    // the game -- check the emitter's caps and gates first.
+    if (hjPrSamples >= 3600)      // ~a whole match of CHANGED samples
         return;
 
     // Only speak when something moved. A first cut logged two lines a second for
@@ -2206,7 +2365,15 @@ void hjDumpPadRing(void)
             sig = (sig * 31) + (u32)*(int*)(n + HJ_PR_BUFFERED)
                 + (u32)*(unsigned char*)(n + HJ_PR_CATCHUP)
                 + (u32)*(unsigned char*)(n + HJ_PR_SKIPS)
-                + (u32)*(signed char*)(n + HJ_PR_THROTTLE);
+                + (u32)*(signed char*)(n + HJ_PR_THROTTLE)
+                // seq IS IN THE SIGNATURE DELIBERATELY, added 2026-09-25. Without it this
+                // was a liveness probe blind to liveness: a ring in steady state (buffered
+                // parked, catchup 0, skips 0, throttle constant) gave an unchanging
+                // signature and total silence while seq advanced perfectly normally, so
+                // silence could not be told from a frozen stream -- the exact question the
+                // probe exists to answer. seq counts messages RECEIVED and is the only
+                // field here that measures whether the remote is still talking to us.
+                + (u32)*(int*)(n + HJ_NW_SEQ);
         }
         if (sig == hjPrLastSig)
             return;
@@ -2234,9 +2401,13 @@ void hjDumpPadRing(void)
         gate = (*(u32*)(nwp + HJ_PR_ACTIVEMSG) != 0)
             && (skips == 0 || (now - lastTick) >= thr);
 
-        HOTJOIN_LOG("padring: [%d] cid=%d buffered=%d frame=%d catchup=%d thr=%d "
+        // seq IS PRINTED, added 2026-09-25 after a round that could not answer its own
+        // question. seq went into the change-detection signature earlier the same day but
+        // not into the output, so the ONE number needed -- whether a remote's received
+        // count is still advancing -- was still unreadable. A signature is not a report.
+        HOTJOIN_LOG("padring: [%d] cid=%d seq=%d buffered=%d frame=%d catchup=%d thr=%d "
             "skips=%d dTick=%d gate=%d msg=%08x\n",
-            i, cid, buffered,
+            i, cid, *(int*)(nwp + HJ_NW_SEQ), buffered,
             (int)*(unsigned char*)(nwp + HJ_PR_ACTIVEFRAME),
             catchup, thr, skips, now - lastTick, gate,
             *(u32*)(nwp + HJ_PR_ACTIVEMSG));
@@ -2263,8 +2434,26 @@ void hjHostReapRemotes(void)
         for (i = 0; i < HJ_NWP_SLOTS; ++i) { lastSeq[i] = 0; stallFrames[i] = 0; }
     }
 
-    // Host only, and only while actually in a game -- the teardown window on
-    // the way out looks identical by state and must not be touched.
+    // Host only, and only while actually in a game.
+    //
+    // CORRECTED 2026-09-25. This comment used to claim the gate protected "the teardown
+    // window on the way out, which looks identical by state and must not be touched". It
+    // does not, and nothing here does. isInMenus() is a LOBBY predicate --
+    //
+    //     isInGame()  =  GAME_ACTIVE && GAME_MAP_ID != 0x27 && SCENE_LOADED == 1
+    //     isInMenus() = !GAME_ACTIVE && GAME_MAP_ID == 0x27 && SCENE_LOADED == 1
+    //
+    // -- so the two are MUTUALLY EXCLUSIVE and the isInMenus() term is strictly redundant
+    // with !isInGame(). It is kept because it costs nothing and reads as intent. What it
+    // emphatically does NOT do is notice an in-game PAUSE menu: pausing clears neither
+    // GAME_ACTIVE nor the map id, so isInMenus() is false throughout.
+    //
+    // The only thing protecting a player who is merely paused is the pad-stall threshold,
+    // and whether that suffices depends on a fact not yet measured: if a client's pad seq
+    // keeps advancing while its pause menu is open, a paused player can never look stalled.
+    // If it freezes at menu-open, a player sitting in the pause menu is reaped -- at 15 s
+    // now, at 8 s in every build before today. Do not add an in-game-menu gate on the
+    // strength of the guess; measure the seq first.
     if (!gameAmIHost() || !isInGame() || isInMenus())
         return;
 
@@ -2825,6 +3014,206 @@ int hjIntroducePeerHook(void * ctx, int peerIdx, int a2, int a3)
 }
 
 // ---------------------------------------------------------------------------
+// Hotjoin section 141: WHAT DRIVES state 3 -> 4?
+//
+// 0x001508d0 holds the only write of peer state 4 in the net module (at 0x1509dc), and
+// it has no jal callers because it is dispatch table[9] -- four entries on from
+// table[5] = 0x00173fc0 = introducePeer, the slot we already hook at 0x001d88b4.
+// Every failure signature we have (the rejoin-after-reap stall, the section 108 staging
+// stall, and section 122's two unexplained failures) is one thing: a peer parked at
+// state 3. So state 3 -> 4 is this function, and the question is only whether it runs.
+//
+// Read off the disassembly, it bails -- WITHOUT writing state 4 -- on five conditions:
+//   1. peers == NULL                                      -> -1
+//   2. peerIdx >= 256                                      -> -1
+//   3. ctx->0x108 != 0                                     -> 8   <-- SILENT
+//   4. *(peers+0x404) (my idx) == 256                      -> -1
+//   5. ctx->vtable[0x48](peers, myIdx) returned NULL        -> -1
+//   6. ctx->0xec == 1  -> diverts to the ctx->0xf0/0xf4 callback and returns 8
+//   7. *(peers+0x400) == NULL                              -> -1
+// and on success writes 4, broadcasts via 0x14bdb0, calls ctx->vtable[0x44](peers,
+// peerIdx) and SETS ctx->0x108 = 1.
+//
+// Two things in that list are worth the whole probe:
+//
+// (a) CONDITION 3 IS A ONCE-ONLY LATCH THAT RETURNS THE SUCCESS CODE. The success path
+//     sets ctx->0x108 = 1; any later call sees it non-zero and returns 8 having done
+//     nothing at all. The caller cannot tell the two apart. It is cleared at 0x171f74,
+//     in the same routine that initialises a peer record to state 2 -- so a second peer
+//     negotiating before any re-init would be silently swallowed.
+//
+// (b) THE STATE-4 WRITE DOES NOT GO TO peers[peerIdx]. It goes to *(peers+0x400), a
+//     SINGLE "peer under negotiation" pointer sitting just below +0x404 (my idx) and
+//     +0x408 (introducer idx). If that slot points at a different peer than the message's
+//     peerIdx, the wrong record is promoted and peerIdx stays at 3 for good. A single
+//     slot is exactly the assumption hot-join breaks, since we negotiate an arriving peer
+//     while others are already established.
+//
+// So this logs, per call: peerIdx, the state of peers[peerIdx] before and after, the
+// 0x400 slot and ITS state, whether the two agree, ctx->0x108 and ctx->0xec as read
+// BEFORE the call (after the call 0x108 is always 1 and says nothing), and the return.
+// Log-only -- it changes no behaviour, which is the point: we do not yet know which of
+// the seven branches we are in.
+#define HJ_T9_SLOT           (0x001d88c4)
+#define HJ_T9_ORIG           (0x001508d0)
+#define HJ_T9_RUNTIME_SLOT   (0x01f4cac4)
+#define HJ_CTX_T9LATCH       (0x108)
+#define HJ_CTX_T9MODE        (0x0ec)
+#define HJ_PEERS_NEGOTIATING (0x400)
+
+static int hjT9Logged = 0;
+
+int hjType9Hook(void * peers, int a1, int peerIdx, void * msg)
+{
+    u32 p = (u32)peers;
+    u32 c = *(u32*)HJ_NET_CTX_PTR;
+    int before = -1, after = -1, negState = -1;
+    u32 neg = 0, latch = 0, mode = 0;
+    void * pp;
+    int ret;
+
+    if (p) {
+        neg = *(u32*)(p + HJ_PEERS_NEGOTIATING);
+        if (neg) negState = *(int*)(neg + 0x08);
+        if (peerIdx >= 0 && peerIdx < 256) {
+            pp = internal_hjPeerLookup(peers, peerIdx);
+            if (pp) before = *(int*)((u32)pp + 0x08);
+        }
+    }
+    if (c) {
+        latch = *(u32*)(c + HJ_CTX_T9LATCH);
+        mode  = *(u32*)(c + HJ_CTX_T9MODE);
+    }
+
+    ret = internal_hjType9(peers, a1, peerIdx, msg);
+
+    if (p && peerIdx >= 0 && peerIdx < 256) {
+        pp = internal_hjPeerLookup(peers, peerIdx);
+        if (pp) after = *(int*)((u32)pp + 0x08);
+    }
+
+    if (hjT9Logged < 48) {
+        ++hjT9Logged;
+        // `match` is the discriminator for (b): 0 means the state-4 write landed on a
+        // peer OTHER than the one this message is about. `latch`/`mode` are the
+        // discriminators for (a) and for condition 6. A line with ret=8, latch=1 and
+        // state unchanged is the silent swallow, and nothing else looks like that.
+        HOTJOIN_LOG("type9: idx=%d state %d -> %d ret=%d latch=%d mode=%d "
+            "neg=%08x negState=%d match=%d p404=%d p408=%d ra=%08x\n",
+            peerIdx, before, after, ret, (int)latch, (int)mode,
+            neg, negState,
+            (neg && peerIdx >= 0 && peerIdx < 256 &&
+             neg == (u32)internal_hjPeerLookup(peers, peerIdx)) ? 1 : 0,
+            p ? *(int*)(p + HJ_PEERS_MYIDX) : -1,
+            p ? *(int*)(p + HJ_PEERS_INTRO) : -1,
+            (u32)__builtin_return_address(0));
+    }
+    return ret;
+}
+
+// ---------------------------------------------------------------------------
+// Hotjoin: hook the ctx-RESIDENT copy of the dispatch table too.
+//
+// There are TWO copies of this table. `0x001724d0` (the ctx constructor tail) builds a
+// second one INSIDE the net ctx from literal lui/addiu immediates rather than copying
+// the static `0x001d88a8`. It writes table[16..18] at ctx+0xc0/c4/c8, which puts type 2
+// at ctx+0x88 and type 9 at ctx+0xa4 (section 142).
+//
+// The static slot is only KNOWN to be live because the introduce hook demonstrably
+// fires. If dispatch actually reads the ctx copy, a round with only the static hook
+// installed draws zero `type9:` lines and tells us nothing except "try the other table
+// tomorrow" -- which costs a whole test round with two machines and a human. Hooking
+// both removes that outcome from the table entirely. `ra` in the type9 line says which
+// copy dispatched.
+//
+// Deriving the slot from the LIVE ctx pointer, not from the hardcoded 0x01f4cac4 seen
+// in one dump: that address is only valid for one particular ctx allocation. The
+// derivation also self-checks -- finding exactly 0x001508d0 at ctx+0xa4 CONFIRMS
+// section 142's offset arithmetic, and finding something else says it is wrong before
+// we have staked a test round on it.
+//
+// Re-checked periodically rather than poked once at install, because the ctx is built
+// after the patch loads and may be rebuilt per game, which would silently restore the
+// vanilla pointer mid-session.
+//
+// SAFETY, because two of my own "defensive" additions have caused the problems they
+// were meant to prevent: this writes ONLY when the slot holds exactly the vanilla
+// handler, so a freed or re-laid-out ctx cannot produce a blind write; re-hooking is
+// idempotent; and hjType9Hook is a transparent wrapper that calls the original and
+// returns its value, so even if BOTH copies dispatch, behaviour is unchanged and the
+// only cost is duplicate log lines.
+#define HJ_CTX_T9SLOT   (0xa4)
+
+static u32 hjT9CtxLast   = 0;
+static int hjT9CtxLogged = 0;
+
+// HARDENED 2026-09-27 after the userver crash (s145/s146). This is the ONLY code in the
+// file that dereferences the net ctx unconditionally -- main.c calls it every 30 frames
+// regardless of game state, so it runs in the lobby and, critically, DURING A LOGIN
+// TRANSITION. Every other HJ_NET_CTX_PTR read is reached from an in-game event.
+//
+// `if (!c)` is not enough. 0x001A1CF0 is game memory, not ours: right after a logout it
+// can still hold a pointer to a torn-down context, which is non-NULL and unusable. The
+// load below then reads a wild address, and an unguarded load is a TLB miss -- the exact
+// fault class that opens the crash cascade in s145.
+//
+// So validate before dereferencing: 4-byte aligned, and the whole read must land inside
+// the 32 MB of EE RAM, above the low region where nothing legitimate lives. The real ctx
+// has been observed around 0x01f4ca20, comfortably inside this.
+//
+// NOT gated on isInGame(): s108's staging stall happens at menus=1 game=0, so a game-state
+// gate would blind the probe to the very case it exists to measure.
+#define HJ_EE_RAM_END    (0x02000000)
+#define HJ_CTX_MIN       (0x00100000)
+
+void hjT9EnsureCtxHook(void)
+{
+    u32 c = *(u32*)HJ_NET_CTX_PTR;
+    u32 slot, held;
+
+    if (!c)
+        return;
+    if ((c & 3) || c < HJ_CTX_MIN || c > HJ_EE_RAM_END - HJ_CTX_T9SLOT - 4) {
+        // Say it once per distinct bogus value rather than every 30 frames.
+        if (c != hjT9CtxLast && hjT9CtxLogged < 8) {
+            hjT9CtxLast = c;
+            ++hjT9CtxLogged;
+            HOTJOIN_LOG("type9 ctx-copy SKIPPED, ctx=%08x is not a usable pointer "
+                "(aligned=%d, in-range=%d)\n",
+                c, (c & 3) == 0,
+                (c >= HJ_CTX_MIN && c <= HJ_EE_RAM_END - HJ_CTX_T9SLOT - 4));
+        }
+        return;
+    }
+
+    slot = c + HJ_CTX_T9SLOT;
+    held = *(u32*)slot;
+
+    if (held == (u32)&hjType9Hook)
+        return;                                 // already ours
+
+    if (held == HJ_T9_ORIG) {
+        POKE_U32(slot, &hjType9Hook);
+        if (c != hjT9CtxLast && hjT9CtxLogged < 8) {
+            hjT9CtxLast = c;
+            ++hjT9CtxLogged;
+            HOTJOIN_LOG("type9 ctx-copy hooked at %08x (ctx=%08x, static slot %08x) "
+                "-- s142 offset CONFIRMED\n", slot, c, HJ_T9_SLOT);
+        }
+        return;
+    }
+
+    // Neither vanilla nor ours: either ctx+0xa4 is not the type-9 entry, or this ctx is
+    // laid out differently. Say so once per ctx rather than poking blind.
+    if (c != hjT9CtxLast && hjT9CtxLogged < 8) {
+        hjT9CtxLast = c;
+        ++hjT9CtxLogged;
+        HOTJOIN_LOG("type9 ctx-copy at %08x holds %08x, expected %08x -- NOT hooked "
+            "(ctx=%08x)\n", slot, held, HJ_T9_ORIG, c);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Hotjoin: what messages actually drive the peer record?
 //
 // 0x150dd8 is the RT handler for message type 22 (registered via `li a0,22` at
@@ -3087,6 +3476,163 @@ int hjMarkConnectedHook(void * peers, int peerIdx, void * out)
         ++hjMarkLogged;
         HOTJOIN_LOG("markconn: idx=%d p408=%d t08 %d -> %d ret=%d\n",
             peerIdx, peers ? *(int*)((u32)peers + 0x408) : -1, before, after, ret);
+    }
+    return ret;
+}
+
+// ---------------------------------------------------------------------------
+// Hotjoin: WHY mark-connected NEVER RUNS, and WHO WRITES p408.   (s150-s151-A)
+//
+// Measured on a live hot-join that looked healthy: roster n=2, both peer records t08=5,
+// pad data flowing BOTH ways -- and the joiner invisible to the host, absent from the
+// radar. `markconn` fired ZERO times on BOTH machines (8288 / 6978 HJ lines as positive
+// controls), so 0x172898 never runs and the engine never registers the peer.
+//
+// CAUTION established in s151: t08 is NOT a trustworthy indicator, because hjAnnounce and
+// hjPromote write `mine->0x08 = 5` OURSELVES. Every side reads "promoted" while none of
+// the engine bookkeeping happened. Only `markconn` firing is evidence, because that is the
+// engine's own action and we merely observe it.
+//
+// The gate lives in the function at 0x001725c0, which is NOT called by any `jal` -- it is
+// a function pointer at 0x001d8828 = ctx+0x08 (ctx is STATIC at 0x001d8820, s149). Its
+// prologue gives the signature: s5 = a0 = peers, s4 = a1 = peerIdx.
+//
+// FIVE bails precede the p408 gate, and our markconn hook cannot distinguish them:
+//   1725f8  beqz s5          -> peers == NULL
+//   17260c  bnel s5,v1       -> peers != ctx->0xE8
+//   172620  beqz v1          -> peerLookup(peers, peerIdx) == NULL
+//   172644  beqz s2          -> auxGet(...) == 0
+//   172658  bne  s4,v1       -> peerIdx != peers->0x408        <- the known gate
+//   172668  jal  0x172898    -> the promoter (what we want to reach)
+// So log 1, 2, 3 and 5 directly; if all four pass and markconn still does not fire, the
+// answer is 4 by elimination.
+#define HJ_PROMOGATE_SLOT (0x001d8828)      /* ctx+0x08 */
+#define HJ_PROMOGATE_ORIG (0x001725c0)
+
+extern int internal_hjPromoteGate(void * peers, int peerIdx);
+
+static int hjPromoGateLogged = 0;
+
+int hjPromoteGateHook(void * peers, int peerIdx)
+{
+    u32 pp = (u32)peers;
+    u32 c  = *(u32*)HJ_NET_CTX_PTR;
+    u32 ctxPeers = c ? *(u32*)(c + HJ_CTX_PEERS) : 0;
+    void * rec;
+    int p408 = -1, p404 = -1, before = -1, after = -1;
+    int ret;
+
+    if (pp) {
+        p408 = *(int*)(pp + 0x408);
+        p404 = *(int*)(pp + 0x404);
+    }
+    rec = (pp && peerIdx >= 0 && peerIdx < 256)
+        ? internal_hjPeerLookup(peers, peerIdx) : 0;
+    if (rec)
+        before = *(int*)((u32)rec + 0x08);
+
+    ret = internal_hjPromoteGate(peers, peerIdx);
+
+    rec = (pp && peerIdx >= 0 && peerIdx < 256)
+        ? internal_hjPeerLookup(peers, peerIdx) : 0;
+    if (rec)
+        after = *(int*)((u32)rec + 0x08);
+
+    // Log every call whose outcome could matter, plus the opening few unconditionally.
+    // A promoted peer is rare, so `t08 %d -> %d` changing is the headline.
+    if (hjPromoGateLogged < 40 || before != after) {
+        ++hjPromoGateLogged;
+        HOTJOIN_LOG("promogate: idx=%d peers=%08x ctxPeers=%08x match=%d "
+            "rec=%08x p404=%d p408=%d gate=%d t08 %d -> %d ret=%d\n",
+            peerIdx, pp, ctxPeers, (pp && pp == ctxPeers) ? 1 : 0,
+            (u32)rec, p404, p408, (peerIdx == p408) ? 1 : 0,
+            before, after, ret);
+    }
+    return ret;
+}
+
+// p408 is written from THREE places, so a probe on one site proves nothing:
+//   0x0016fa84  jal 0x171d18   -- the LOCAL connect-path publish. This is why a host that
+//                                opens a game has p408 == 0 (its own index) rather than
+//                                the 256 initial value (s151-A).
+//   ctx+0x44 = 0x001d8864      -- the indirect call taken by the type-22 receive branch
+//                                when msgType == 5; writes payload[1] = SENDER'S index.
+//   our own hjPromote          -- internal_hjPublishMyIndex(peers, peers->0x404).
+// s151-A narrowed the failure to three candidates and this catches all three at once:
+// never set to the joiner's index / set then clobbered back / set correctly but unused.
+#define HJ_SETP408_SLOT (0x001d8864)        /* ctx+0x44 */
+#define HJ_SETP408_ORIG (0x00171d18)
+#define HJ_SETP408_SITE (0x0016fa84)        /* direct jal, local publish */
+#define HJ_SETP408_CALL (0x0c05c746)
+
+static int hjP408Logged = 0;
+
+int hjSetP408Hook(void * peers, int value)
+{
+    u32 ra = (u32)__builtin_return_address(0);
+    u32 pp = (u32)peers;
+    int before = pp ? *(int*)(pp + 0x408) : -1;
+    int ret = internal_hjPublishMyIndex(peers, value);
+    int after = pp ? *(int*)(pp + 0x408) : -1;
+
+    // Always log a CHANGE -- a 1 -> 0 rewrite is the whole question -- and sample the rest
+    // so a caller firing every few seconds cannot bury it.
+    if (before != after || hjP408Logged < 24) {
+        ++hjP408Logged;
+        HOTJOIN_LOG("setp408: %d -> %d arg=%d ra=%08x me=%d ret=%d\n",
+            before, after, value, ra, pp ? *(int*)(pp + 0x404) : -1, ret);
+    }
+    return ret;
+}
+
+// ---------------------------------------------------------------------------
+// Hotjoin: THE REAL 3 -> 4 TRANSITION.   (s159, s160)
+//
+// Four functions in the net module write t08 = 4 (0x001509dc, 0x00154f64, 0x0016bde4,
+// 0x0016d864) -- my notes claimed for days that 0x1509dc was the ONLY one, and that single
+// false premise is what launched the whole "message type 9" dead end (s156, s158-A).
+//
+// 0x0016d7c8..0x0016d87c is a message handler `(peer, type, payload, len)` that performs the
+// 3 -> 4 promotion, and its three conditions are readable:
+//     16d810  bne  s0,64    -> BAIL unless LENGTH == 64
+//     16d848  bne  v1,3     -> only if the peer's CURRENT state is 3
+//     16d850  jal  0x16c710 -> only if this returns 0
+//     16d864  sw   v0,8(s2) -> peer->0x08 = 4
+//
+// We cannot hook 0x0016d7c8 itself: it has no `jal` callers and its address appears nowhere
+// as data, so it is almost certainly a switch-case target reached by a computed `jr`.
+// But the GATE is callable -- `0x0016c710` has exactly two call sites, 0x0016bdd0 and
+// 0x0016d850, and the latter IS the one in this path. Hooking that `jal` places a probe
+// between condition 2 and condition 3, so a line appearing at all proves length==64 AND
+// state==3 both passed, and the return value says whether the promotion follows.
+//
+// 0x0016bdd0 is the other caller and sits beside 0x0016bde4, ANOTHER t08=4 writer -- so there
+// are two similar 3 -> 4 paths. Hook both and let the ra distinguish them.
+//
+// Log-only. No behaviour change. Unlike the type-9 probes this cannot be chasing something
+// nonexistent: each site is a literal store of 4 into a peer record.
+#define HJ_S34_GATE_A   (0x0016d850)      /* jal 0x16c710 inside the 3->4 handler */
+#define HJ_S34_GATE_B   (0x0016bdd0)      /* the other caller, beside 0x0016bde4 */
+#define HJ_S34_GATE_CALL (0x0c05b1c4)     /* jal 0x0016c710 */
+
+extern int internal_hjS34Gate(void * peer);
+
+static int hjS34Logged = 0;
+
+int hjS34GateHook(void * peer)
+{
+    u32 ra = (u32)__builtin_return_address(0);
+    u32 pp = (u32)peer;
+    int before = pp ? *(int*)(pp + 0x08) : -1;
+    int ret = internal_hjS34Gate(peer);
+    int after = pp ? *(int*)(pp + 0x08) : -1;
+
+    // Always log a state change; sample the rest. Reaching here at all is the headline,
+    // because it means the length and state tests already passed.
+    if (before != after || hjS34Logged < 32) {
+        ++hjS34Logged;
+        HOTJOIN_LOG("s34gate: peer=%08x t08 %d -> %d ret=%d ra=%08x "
+            "(ret==0 promotes to 4)\n", pp, before, after, ret, ra);
     }
     return ret;
 }
@@ -4023,6 +4569,62 @@ void hjInstallPlayerBitGuard(void)
             HJ_INTRO_SLOT, *(u32*)HJ_INTRO_SLOT, HJ_INTRO_ORIG);
     }
 
+    // Both slots are reported whether or not we hook, because 0x001724d0 builds a
+    // SECOND copy of this table inside the net ctx from literal immediates rather than
+    // copying 0x001d88a8 -- so if the static poke turns out to draw no type9 lines at
+    // all, the runtime copy is where dispatch is really reading from.
+    if (*(u32*)HJ_T9_SLOT == HJ_T9_ORIG) {
+        POKE_U32(HJ_T9_SLOT, &hjType9Hook);
+        HOTJOIN_LOG("type9 hook installed at slot %08x (runtime copy %08x holds %08x)\n",
+            HJ_T9_SLOT, HJ_T9_RUNTIME_SLOT, *(u32*)HJ_T9_RUNTIME_SLOT);
+    } else {
+        HOTJOIN_LOG("type9 slot %08x holds %08x, expected %08x -- NOT hooked\n",
+            HJ_T9_SLOT, *(u32*)HJ_T9_SLOT, HJ_T9_ORIG);
+    }
+
+    // s150/s151-A: the promoter gate and every p408 writer. These are the probes that
+    // matter now -- type 9 never arrives (s149), so table[9] tells us nothing.
+    if (*(u32*)HJ_PROMOGATE_SLOT == HJ_PROMOGATE_ORIG) {
+        POKE_U32(HJ_PROMOGATE_SLOT, &hjPromoteGateHook);
+        HOTJOIN_LOG("promogate hook installed at ctx slot %08x\n", HJ_PROMOGATE_SLOT);
+    } else {
+        HOTJOIN_LOG("promogate slot %08x holds %08x, expected %08x -- NOT hooked\n",
+            HJ_PROMOGATE_SLOT, *(u32*)HJ_PROMOGATE_SLOT, HJ_PROMOGATE_ORIG);
+    }
+
+    if (*(u32*)HJ_SETP408_SLOT == HJ_SETP408_ORIG) {
+        POKE_U32(HJ_SETP408_SLOT, &hjSetP408Hook);
+        HOTJOIN_LOG("setp408 hook installed at ctx slot %08x\n", HJ_SETP408_SLOT);
+    } else {
+        HOTJOIN_LOG("setp408 slot %08x holds %08x, expected %08x -- NOT hooked\n",
+            HJ_SETP408_SLOT, *(u32*)HJ_SETP408_SLOT, HJ_SETP408_ORIG);
+    }
+
+    if (*(u32*)HJ_SETP408_SITE == HJ_SETP408_CALL) {
+        HOOK_JAL(HJ_SETP408_SITE, &hjSetP408Hook);
+        HOTJOIN_LOG("setp408 hook installed at local publish site %08x\n", HJ_SETP408_SITE);
+    } else {
+        HOTJOIN_LOG("setp408 site %08x holds %08x, expected %08x -- NOT hooked\n",
+            HJ_SETP408_SITE, *(u32*)HJ_SETP408_SITE, HJ_SETP408_CALL);
+    }
+
+    // s160: the real 3 -> 4 gate. Guarded on the exact `jal` encoding so a wrong address
+    // declines instead of corrupting code.
+    if (*(u32*)HJ_S34_GATE_A == HJ_S34_GATE_CALL) {
+        HOOK_JAL(HJ_S34_GATE_A, &hjS34GateHook);
+        HOTJOIN_LOG("s34gate hook installed at %08x\n", HJ_S34_GATE_A);
+    } else {
+        HOTJOIN_LOG("s34gate site %08x holds %08x, expected %08x -- NOT hooked\n",
+            HJ_S34_GATE_A, *(u32*)HJ_S34_GATE_A, HJ_S34_GATE_CALL);
+    }
+    if (*(u32*)HJ_S34_GATE_B == HJ_S34_GATE_CALL) {
+        HOOK_JAL(HJ_S34_GATE_B, &hjS34GateHook);
+        HOTJOIN_LOG("s34gate hook installed at %08x\n", HJ_S34_GATE_B);
+    } else {
+        HOTJOIN_LOG("s34gate site %08x holds %08x, expected %08x -- NOT hooked\n",
+            HJ_S34_GATE_B, *(u32*)HJ_S34_GATE_B, HJ_S34_GATE_CALL);
+    }
+
     if (*(u32*)HJ_CONNECT_SLOT == HJ_CONNECT_ORIG) {
         POKE_U32(HJ_CONNECT_SLOT, &hjConnectHook);
         HOTJOIN_LOG("connect hook installed at slot %08x\n", HJ_CONNECT_SLOT);
@@ -4033,6 +4635,8 @@ void hjInstallPlayerBitGuard(void)
 
     HOTJOIN_LOG("guards installed: playerbit %08x, retransmit INTACT, 4 peer-connect-req sites\n",
         HJ_PLAYERBIT_VTABLE_SLOT);
+
+    HOTJOIN_LOG("build: " HJ_BUILD_TAG "\n");
 }
 #else
 void hjInstallPlayerBitGuard(void) { }
@@ -4057,6 +4661,7 @@ void hjLogEpochTock(void) { }
 void hjDumpPeers(void) { }
 void hjInstallType22Probe(void) { }
 void hjRefreshPeerActivity(void) { }
+void hjT9EnsureCtxHook(void) { }
 void hjInstallLeaveCallerProbe(void) { }
 void hjInstallLeaveActionProbe(void) { }
 void hjInstallBackoutProbe(void) { }

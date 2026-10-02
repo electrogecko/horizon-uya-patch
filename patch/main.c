@@ -99,6 +99,7 @@ void hjLogEpochTock(void);
 void hjDumpPeers(void);
 void hjInstallType22Probe(void);
 void hjRefreshPeerActivity(void);
+void hjT9EnsureCtxHook(void);
 // int patchBuddies(void * ui, long pad);
 // int patchPlayerDetails(void * ui, long pad);
 // int patchStats(void * ui, int pad);
@@ -3089,6 +3090,15 @@ int main(void)
 	hjInstallBackoutProbe();
 	hjDumpPeers();
 	hjRefreshPeerActivity();
+	// Every 30 frames (0.5 s), not per frame: cheap enough either way, but per-frame
+	// instrumentation has measurably degraded join reliability here before, and 0.5 s is
+	// far inside the ~11 s negotiation window this has to be in place for.
+	{
+		static int hjT9CtxTick = 0;
+		if ((hjT9CtxTick % 30) == 0)
+			hjT9EnsureCtxHook();
+		++hjT9CtxTick;
+	}
 	{
 		static int hjHeartbeat = 0;
 		if ((hjHeartbeat % 120) == 0)
