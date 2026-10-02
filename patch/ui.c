@@ -1314,14 +1314,17 @@ void hjAnnounce(void)
         && *(int*)(HJ_SM_BASE + HJ_SM_STATE) == 9) {
         if (++hjPromoteStall == HJ_PROMOTE_STALL) {
             void * p0 = internal_hjPeerLookup((void*)peers, 0);
-            *(int*)(mine + 0x08) = 5;
+            // s163: 4, not 5. This is the stuck-at-3 safety net, and it must leave us in the
+            // state the election can act on. Writing 5 here made us permanently unelectable,
+            // which is the same mistake as the announce block above.
+            *(int*)(mine + 0x08) = 4;
             *(int*)(mine + 0x18) = 1;
             internal_hjPublishMyIndex((void*)peers, *(int*)(peers + 0x404));
             {
                 u32 nctx = *(u32*)HJ_NET_CTX_PTR;
                 int gateA = nctx ? *(int*)(nctx + 0x10C) : -1;
                 int r = internal_hjCheckAllConnected();
-                HOTJOIN_LOG("promote: myRec %08x 3 -> 5 after %d frames; idx %d; p0 t08=%d f1C=%d p408=%d p43C=%d gateA=%d check=%d sm=%d gs=%p\n",
+                HOTJOIN_LOG("promote: myRec %08x 3 -> 4 after %d frames; idx %d; p0 t08=%d f1C=%d p408=%d p43C=%d gateA=%d check=%d sm=%d gs=%p\n",
                     mine, HJ_PROMOTE_STALL, *(int*)(peers + 0x404),
                     p0 ? *(int*)((u32)p0 + 0x08) : -1, p0 ? *(int*)((u32)p0 + 0x1C) : -1,
                     *(int*)(peers + 0x408), *(int*)(peers + 0x43C), gateA, r,
@@ -1343,16 +1346,31 @@ void hjAnnounce(void)
             return;
     }
 
-    if (*(u32*)(peers + 0x438) == 0 && *(int*)(mine + 0x08) == 4) {
-        *(int*)(mine + 0x08) = 5;
+    // s163/s163-A: DO NOT write 5 here any more.
+    // This block's own gate is `mine08 == 4`, which means the ENGINE has just promoted us
+    // 3 -> 4 by itself (observed live: mine08 read 3 at 75573.5156 and this block fired at
+    // 75573.7188). Writing 5 here consumed that state immediately -- and the election at
+    // 0x00172898 considers ONLY peers with t08 == 4, so it could never elect us. We were
+    // destroying the candidate we had just been handed.
+    // The value is ALSO the inner message type the sender reads from myRecord->0x08, so it is
+    // set to 5 only momentarily around each send below and left at 4 the rest of the time.
+    // REGRESSION FIX, s163-B. `!hjAnnounceDone` MUST be in this gate.
+    // The old code wrote `mine08 = 5` here, which made this block's own `mine08 == 4` gate
+    // false -- so that write was an IMPLICIT LATCH, not just a state change. Removing it in
+    // 20260929a left the gate true forever, so the block re-ran EVERY FRAME and reset
+    // hjAnnounceSends and hjAnnounceTick each time. Measured consequences: the send counter
+    // never advanced past 1/240, the tick reset to 0 made `--tick <= 0` true immediately, and
+    // HJ_ANNOUNCE_MAX_SENDS was therefore NEVER reached -- so we broadcast at frame rate
+    // indefinitely instead of 240 times. Unbounded traffic, caused by me.
+    // Found by the mbp agent from a before/after difference in the counter, which it flagged
+    // without being able to place the cause.
+    if (!hjAnnounceDone && *(u32*)(peers + 0x438) == 0 && *(int*)(mine + 0x08) == 4) {
         *(int*)(mine + 0x18) = 1;
         hjAnnounceSends = 0;
         hjAnnounceTick = 0;
-        if (!hjAnnounceDone) {
-            hjAnnounceDone = 1;
-            HOTJOIN_LOG("announce: myRecord %08x 0x08 -> 5, 0x18 -> 1 (p438=0), sending\n",
-                mine);
-        }
+        hjAnnounceDone = 1;
+        HOTJOIN_LOG("announce: myRecord %08x armed at 0x08=4, 0x18 -> 1 (p438=0), sending\n",
+            mine);
     }
 
     // Retransmit: these are UDP datagrams and this protocol demonstrably depends on
@@ -1362,13 +1380,23 @@ void hjAnnounce(void)
     // record already sits at 5 from the moment it opens the game, so without this gate
     // the host also ran the send loop -- 240 unsolicited type-5 broadcasts per game,
     // from a machine that has nothing to announce. That is traffic vanilla never emits.
-    if (hjAnnounceDone && *(int*)(mine + 0x08) == 5
+    // Gate accepts 4 OR 5: the record now rests at 4 between sends (s163).
+    if (hjAnnounceDone
+        && (*(int*)(mine + 0x08) == 5 || *(int*)(mine + 0x08) == 4)
         && hjAnnounceSends < HJ_ANNOUNCE_MAX_SENDS) {
         if (--hjAnnounceTick <= 0) {
             hjAnnounceTick = (hjAnnounceSends < HJ_ANNOUNCE_BURST_SENDS)
                            ? HJ_ANNOUNCE_BURST_PERIOD : HJ_ANNOUNCE_PERIOD;
             ++hjAnnounceSends;
+            // The sender at 0x14bdb0 reads the outbound inner type straight out of
+            // myRecord->0x08 (14be08 `lbu v1,8(s0)` -> payload[0]), so the wire type and the
+            // state the election reads are THE SAME FIELD. Hold 5 across the send so the wire
+            // is byte-identical to before -- receivers keep getting inner-type-5, which is what
+            // sets their p408 and was measured working 112 times -- then drop back to 4 so we
+            // remain electable.
+            *(int*)(mine + 0x08) = 5;
             internal_hjSendPeerMsg((void*)peers, -1);
+            *(int*)(mine + 0x08) = 4;
             // 1 Hz for minutes would flood the console; log the early ones (the load
             // phase) then sample, so the tail is still visible without drowning the rest.
             if (hjAnnounceSends <= 5 || (hjAnnounceSends % 10) == 0)
