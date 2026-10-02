@@ -1468,7 +1468,33 @@ int hjReapBlockFrames[GAME_MAX_PLAYERS];
 // bit saying we have not yet seen it move. Consumed by hjHostSpawnRemotes.
 int hjSpawnBlocked = 0;
 int hjSpawnSeq[GAME_MAX_PLAYERS];
-#define HJ_REAP_BLOCK_MAX  (900)   // 15 s, then adopt anyway rather than hang
+// HJ_REAP_BLOCK_MAX -- how long the re-adopt block may hold before giving up.
+//
+// RAISED 900 -> 3600 on 2026-09-26, because 900 caused the exact churn it was meant to
+// prevent. Measured on the SIGSTOP vanished-client round:
+//
+//     8531.82  reap + release slot 1            (block armed)
+//     8546.84  "unblocked on timeout after 900 frames"   = 901 frames, 15.02 s
+//              -> adopt immediately rewrote roster slot 1, n -> 2, WITH NO PEER THERE
+//     8566.67  "unblocked, stale peer cleared"   = 2091 frames, 34.85 s
+//              -> roster corrected back to n = 1
+//
+// 19.8 s of PHANTOM SECOND PLAYER. The escape hatch opened while the departing peer record
+// was still sitting at state 5, and the adopt loop's `state == 5` test cannot tell a dying
+// record from a fresh one -- so it adopted the corpse. The frozen client had not sent
+// anything and did not resume until ~62 s later.
+//
+// THE TIMEOUT WAS GUARDING AGAINST A DEADLOCK THAT CANNOT HAPPEN HERE, and the comment in
+// hjHostAdoptPeers already says why: "the stale one is torn down independently of anything we
+// do". A gate waiting on someone else's teardown cannot deadlock on our own inaction -- unlike
+// the pad-sequence gate of section 89, which genuinely could. So this hatch was belt-and-braces
+// against a risk the same file argues away, and it became the bug.
+//
+// 3600 frames = 60 s, against a measured teardown of 34.85 s. Kept rather than removed because
+// "peerclose always arrives" is observed, not guaranteed, and a slot blocked forever would stop
+// that player ever rejoining. But it is now an ANOMALY threshold, not a routine one: if it ever
+// fires, the peer record outlived its own teardown by 25 s and that is worth knowing about.
+#define HJ_REAP_BLOCK_MAX  (3600)
 
 // Identical redefinitions, same reason as the block above: these are needed here as
 // well as beside hjDumpNWPlayers, and the reaper lives 800 lines further down.
@@ -2929,7 +2955,34 @@ void hjDumpPadRing(void)
 // 8 seconds at 60fps. A pad stream runs at ~15/s, so this is ~120 missed
 // messages -- far beyond any lag spike, but still well inside the window
 // before a returning player tries to rejoin.
-#define HJ_REAP_FRAMES    (480)
+// REVISED 2026-09-25. 900 frames = 15 s at 60 Hz. Was 480 (8.0 s), which collided with
+// the game's own leave latency almost exactly.
+//
+// What the reaper races is PROPAGATION -- the delay between a client leaving and the host
+// learning of it -- and that is a DIFFERENT quantity from how long the leaving client takes
+// to tear itself down locally. The two were conflated twice, in opposite directions,
+// because on one machine they happen to be nearly equal.
+//
+//   departure OBSERVED BY HOST   7.48, 7.57, 7.62, 7.73, 7.82, 8.33, 9.33 s
+//                                (7 samples, both directions, both hosts)
+//   local teardown of the leaver 2.24, 2.55 s (one machine) / ~7.4-7.7 s (the other)
+//
+// Against 480 frames TWO OF SEVEN propagation samples are over -- roughly a third of
+// departures would take the stall path instead of the clean one. 900 clears the observed
+// 9.33 s maximum by 5.7 s, which is adequate rather than generous given that nothing is
+// known about what governs the excursions.
+//
+// VALIDATED 2026-09-25 on a real run: a clean leave at 7.62 s propagation was taken by the
+// roster-driven path and the stall reaper never fired -- zero reap lines in the session.
+//
+// COVERAGE GAP: all seven samples are ONE case -- a non-host leaving a match it joined
+// mid-game. No first-join departure and no host departure has ever been timed.
+//
+// A TOPOLOGY OBJECTION WAS RAISED AND IS DISPROVEN: a host on the Horizon server's own
+// subnet observed a departure at 8.33 s, INSIDE the band measured from a host one router
+// hop away. Co-location bought nothing, so the delay is not a function of host-to-server
+// distance.
+#define HJ_REAP_FRAMES    (900)
 
 extern int hjAdopted;
 
@@ -3010,10 +3063,57 @@ void hjHostReapRemotes(void)
         // that one gated ADMISSION on evidence only available after admission, this
         // one gates EVICTION on evidence that has not had time to appear yet.
         if (seq <= 0 || seq != lastSeq[i] || buffered > 0) {
+            // WHY THE RESET REASON IS LOGGED, once per slot per transition.
+            //
+            // Until 2026-09-25 this function logged ONLY when it fired, so "the stream
+            // never stalled" and "the stream stalled but something pinned the counter at
+            // zero" produced identical logs -- total silence -- despite opposite meanings.
+            //
+            // `buffered > 0` is the suspect clause: seq counts messages RECEIVED, while
+            // buffered is a CONSUMER-side quantity, so a ring that stops draining pins the
+            // counter at zero forever and the slot becomes permanently un-reapable. That
+            // would defeat the reaper's only purpose, collecting a client that crashed or
+            // vanished.
+            //
+            // MEASURED 2026-09-25, AND THE CLAUSE STAYS. I had written here that it was
+            // "wrong on principle" and planned to drop it, on the theory that a frozen
+            // client's ring might never drain and would pin the counter at zero forever.
+            // A SIGSTOP test of a genuinely vanished client says otherwise:
+            //
+            //   frozen/dead client    buffered = 0 from the FIRST stalling line -> reap
+            //                         proceeded, fired at exactly 900 frames (14.998 s)
+            //   merely-paused player  buffered = 2 steadily -> reap correctly blocked
+            //
+            // So this clause does the right thing in BOTH cases: it protects a paused player
+            // and does not obstruct a dead one. Dropping it would have exposed paused players
+            // to deletion while fixing nothing. The distinction the reaper needs -- paused
+            // versus gone -- is carried by whether the ring drains, and the ring already
+            // reports it.
+            //
+            // Leave this alone. `reason=BUFFERED-HELD` is kept as a tripwire: if it ever
+            // appears on a client that is genuinely gone, the premise above has broken.
+            //
+            // Logged on TRANSITION only, so a healthy slot is silent and this cannot become
+            // per-frame volume -- per-frame probes took joins from 2 tries to 9 once.
+            if (stallFrames[i] > 0) {
+                HOTJOIN_LOG("reap: nwp[%d] cid=%d stall reset after %d frames "
+                    "(seq=%d last=%d buffered=%d) reason=%s\n",
+                    i, cid, stallFrames[i], seq, lastSeq[i], buffered,
+                    (seq <= 0)          ? "seq-nonpositive"
+                  : (seq != lastSeq[i]) ? "seq-advanced"
+                  :                       "BUFFERED-HELD");
+            }
             lastSeq[i] = seq;
             stallFrames[i] = 0;
             continue;
         }
+
+        // Progress, so a stall in flight is visible rather than inferred from silence.
+        // Every 150 frames is 2.5 s at 60 Hz: six lines before a reap at 900, none for a
+        // healthy slot.
+        if ((stallFrames[i] % 150) == 0)
+            HOTJOIN_LOG("reap: nwp[%d] cid=%d stalling %d/%d frames (seq=%d buffered=%d)\n",
+                i, cid, stallFrames[i], HJ_REAP_FRAMES, seq, buffered);
 
         if (++stallFrames[i] < HJ_REAP_FRAMES)
             continue;
