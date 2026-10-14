@@ -77,6 +77,13 @@ void onMapLoaderOnlineMenu(void);
 
 int patchCreateGame(void *ui, long pad);
 int patchStaging(void * ui, long pad);
+void hjInstallGameDetailsHook(u32 stagingUpdateSlot);   // s210, patch/ui.c
+void hjLogWhere(void);                                 // s211, patch/ui.c
+void hjTeamSelectPrompt(void);        // s207, patch/ui.c
+void hjApplyTeamChoice(void);         // s207, patch/ui.c
+void hjSendTeamPref(void);            // s208, patch/ui.c
+void hjHostApplyLateTeamPref(void);   // s208-B, patch/ui.c
+int  hjOnTeamPrefMsg(void*, void*);   // s208, patch/ui.c
 void hjInstallPlayerBitGuard(void);
 void hjInstallAuxAcceptProbe(void);
 void hjFixMissingPads(void);
@@ -3033,6 +3040,7 @@ int main(void)
 	//
   	// netInstallCustomMsgHandler(CUSTOM_MSG_ID_CLIENT_RESPONSE_DATE_SETTINGS, &onServerTimeResponse);
 	netInstallCustomMsgHandler(CUSTOM_MSG_ID_PLAYER_VOTED_TO_END, &onClientVoteToEndRemote);
+	netInstallCustomMsgHandler(CUSTOM_MSG_ID_HJ_TEAM_PREF, &hjOnTeamPrefMsg);   // s208
 	netInstallCustomMsgHandler(CUSTOM_MSG_ID_VOTE_TO_END_STATE_UPDATED, &onClientVoteToEndStateUpdateRemote);
 	
 	// Run map loader
@@ -3051,12 +3059,23 @@ int main(void)
 
 	// Hot-join instrumentation heartbeat (temporary). Proves the patch is loaded and
 	// that printf reaches the EE console, independently of whether staging is entered.
+	hjLogWhere();                                    // s211: one named line per screen change
+	hjInstallGameDetailsHook(UI_PTR_FUNC_STAGING);   // s210
 	hjInstallPlayerBitGuard();
 	hjInstallAuxAcceptProbe();
 	hjFixMissingPads();
 	hjInstallType22Probe();
 	hjLogEpochTock();
 	hjAnnounce();
+	// s207-B: moved here from onOnlineMenu. onOnlineMenu is installed by patching four
+	// specific draw call-sites (0x005760E4 etc) and does NOT run on the GAME DETAILS
+	// screen -- which is why the first build produced no dialog AND no log line at all.
+	// main() runs every frame whatever menu is up, so the prompt gets a chance to see
+	// its screen; it still gates on uiGetActiveMenu internally.
+	hjTeamSelectPrompt();       // s207: pre-join team picker
+	hjSendTeamPref();           // s208: tell the host which team we want
+	hjHostApplyLateTeamPref();  // s208-B: honour a preference that arrived after adopt
+	hjApplyTeamChoice();        // s207: local fallback once in game
 	hjHostAdoptPeers();
 	hjHostRefreshNames();
 	hjInstallNameHandler();

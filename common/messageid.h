@@ -177,6 +177,28 @@ enum CustomMessageId
     /*
      * Start of custom message ids reserved for custom game modes.
      */
+    /*
+     * s208: a hot-joiner announces its chosen team to the host, so the host can honour it
+     * at adopt time. A joiner-side write to gs->PlayerTeams does NOT propagate upward
+     * (measured: host held 1 for 30 samples while the joiner read 0), and skin and spawn
+     * base are both derived from the HOST's value, so the choice must reach the host.
+     */
+    /*
+     * s208-E: the hot-join name sync. This used to be a bare `#define
+     * CUSTOM_MSG_ID_HOTJOIN_NAME (32)` local to patch/ui.c, invisible from here -- and
+     * CUSTOM_MSG_ID_HJ_TEAM_PREF was given the same 32. Both handlers install into
+     * callbacks[32]; hjInstallNameHandler() runs LAST in main() and every frame, so the
+     * name handler always won. Team-preference messages were dispatched into
+     * hjOnRemoteName, which read them as HjNameMsg_t, saw name[0] == 0 and returned at
+     * its `len <= 0` guard WITHOUT logging. The message left the joiner, the DME
+     * relayed it to the host (server log: RT_MSG_CLIENT_APP_BROADCAST in,
+     * RT_MSG_CLIENT_APP_SINGLE TargetOrSource:1 out), and it vanished on arrival.
+     * Keep every id in this one enum so a collision is visible.
+     */
+    CUSTOM_MSG_ID_HOTJOIN_NAME = 32,
+
+    CUSTOM_MSG_ID_HJ_TEAM_PREF = 33,
+
     CUSTOM_MSG_ID_GAME_MODE_START = 100,
 };
 
@@ -250,6 +272,11 @@ typedef struct ServerResponseBootElf {
   u32 Address;
   u32 Size;
 } ServerResponseBootElf_t;
+
+typedef struct HjTeamPref {
+  int ClientId;      // who this preference is for
+  int Team;          // 0 = Blue, 1 = Red  (Auto never sends)
+} HjTeamPref_t;
 
 typedef struct ClientSetClientTypeRequest {
   int ClientType;

@@ -162,7 +162,7 @@ extern mapOverrideResponse;
 // Bump by hand for any build handed to a tester, and identify rounds by this string. An md5
 // still identifies a build on the SERVER machine, where the file exists and the bind mount
 // can be verified; the tag is the only identifier available on a client.
-#define HJ_BUILD_TAG   "20260929b-arm-latch-fix"
+#define HJ_BUILD_TAG   "20261011k-where"
 
 // ---------------------------------------------------------------------------
 // Hotjoin: guard the per-player registration that faults for a late joiner.
@@ -194,6 +194,13 @@ extern mapOverrideResponse;
 // without also running during the identical-looking window on the way OUT of a
 // game. Declared outside the NTSC block because patchStaging is common code.
 int hjSeedArmed = 0;
+
+// s209-G: these two are used by patchGameDetails, which is compiled for BOTH regions, so
+// they must live OUTSIDE the #ifndef UYA_PAL block below. Putting them inside it built
+// fine for NTSC and failed the PAL link -- and because bin/ is bind-mounted, that failure
+// DELETED the served artifact. Region-guarded definitions and unguarded users do not mix.
+int hjTeamPromptAsked = 0;       // armed on entry to GAME DETAILS, per join attempt
+static const char * hjTeamChoiceOptions[] = { "Auto (balance teams)", "Blue", "Red" };
 
 #ifndef UYA_PAL
 #define HJ_PLAYERBIT_VTABLE_SLOT    (0x001dd970)
@@ -1173,6 +1180,75 @@ extern int internal_hjPublishMyIndex(void * peers, int idx);   // 0x171d18
 // globals (ctx->0xE8, netctx->0x10C, peers->0x400/0x404).
 extern int internal_hjCheckAllConnected(void);   // 0x171d30
 
+// ---------------------------------------------------------------------------
+// s211: hjLogWhere -- say where the client IS, in one line, on change.
+//
+// This session burned a large fraction of its effort taking screenshots to answer "which
+// menu am I on", then driving a press, then screenshotting again. The patch already knew
+// the answer: the three active-menu slots at 0x01c5c110/114/118. menuscan logged them,
+// but as raw ids behind a 400-line cap, so it documented the dialog hunt rather than
+// serving as a navigation oracle.
+//
+// One named line per transition, uncapped (it is edge-triggered, so it costs nothing when
+// nothing moves). A driver can now `grep -a 'HJ where:' emulog.txt | tail -1` instead of
+// fetching and decoding a PNG, which is both cheaper and not subject to screenshot lag --
+// the stale GAME INFO screenshot that had me telling the user maxTest2 was still in the
+// lobby would not have survived this check.
+//
+// In game the UI slots hold reused memory, so scanning them yields dozens of false
+// matches. Report IN_GAME directly there and only scan when actually in menus.
+static const char * hjMenuName(int id)
+{
+    switch (id) {
+        case UI_MENU_SELECT_PROFILE:        return "PROFILES";
+        case UI_MENU_ONLINE_AGREEMENT:      return "LICENSE_AGREEMENT";
+        case UI_MENU_ONLINE_AGREEMENT_2:    return "LICENSE_AGREEMENT_2";
+        case UI_MENU_ANNOUNCEMENTS:         return "ANNOUNCEMENTS";
+        case UI_MENU_BUDDY_LIST:            return "BUDDIES";
+        case UI_MENU_CREATE_GAME:           return "CREATE_GAME";
+        case UI_MENU_FIND_GAME:             return "FIND_GAME";
+        case UI_MENU_GAME_DETAILS:          return "GAME_DETAILS";
+        case UI_MENU_KEYBOARD:              return "KEYBOARD";
+        case UI_MENU_ONLINE_LOBBY:          return "ONLINE_LOBBY";
+        case UI_MENU_PLAYER_DETAILS:        return "PLAYER_DETAILS";
+        case UI_MENU_CITY:                  return "CITY";
+        case UI_MENU_STAGING:               return "STAGING";
+        case UI_MENU_CHANGE_SKIN_TEAM:      return "CHANGE_SKIN_TEAM";
+        case UI_MENU_STATS:                 return "STATS";
+        case UI_MENU_CITY_SELECT:           return "CITY_SELECT";
+        case UI_MENU_IN_GAME_DETAILS:       return "IN_GAME_DETAILS";
+        case UI_MENU_WEAPON_SELECT:         return "WEAPON_SELECT";
+        default:                            return "?";
+    }
+}
+
+void hjLogWhere(void)
+{
+    static int lastTop = -2;
+    static int lastIn  = -2;
+    int top = -1, w, i, ig = isInGame(), im = isInMenus();
+
+    if (!im) {
+        top = -1;                       // in game: the UI slots are reused memory
+    } else {
+        for (w = 2; w >= 0 && top < 0; --w)      // topmost slot wins
+            for (i = 0; i <= 42; ++i)
+                if (uiGetActiveMenu(i, w)) { top = i; break; }
+    }
+
+    if (top == lastTop && ig == lastIn)
+        return;
+    lastTop = top;
+    lastIn  = ig;
+
+    if (!im && ig)
+        HOTJOIN_LOG("where: IN_GAME\n");
+    else if (top >= 0)
+        HOTJOIN_LOG("where: %s (id %d) inGame=%d\n", hjMenuName(top), top, ig);
+    else
+        HOTJOIN_LOG("where: LOADING/NONE inGame=%d menus=%d\n", ig, im);
+}
+
 void hjAnnounce(void)
 {
     u32 ctx = *(u32*)HJ_NET_CTX_PTR;
@@ -1580,6 +1656,439 @@ void hjPeerClosedRemote(int idx, int t08)
     hjReleaseRemoteSlot(idx, gs, "peer closed");
 }
 
+// ---------------------------------------------------------------------------
+// s208: deliver the joiner's team choice TO THE HOST, before it adopts.
+//
+// WHY. s207 let the joiner write its own gs->PlayerTeams[] every frame. That changed the
+// byte and nothing else. Measured: the joiner read 0 (Blue) with the log line proving our
+// write, while the HOST held 1 (Red) for 30 consecutive samples over 2.5 minutes -- a
+// joiner-side write does NOT propagate upward. Worse, the joiner's OWN skin rendered red
+// and it spawned at the RED base, so even locally the derived state follows the HOST's
+// value, not the byte it had just written.
+//
+// So teams are host-authoritative in EFFECT. The choice has to reach the host, and it has
+// to be there before the player object is built -- which is why s206 auto-assign works:
+// it writes at adopt, on the owning machine, before anything derives from it.
+//
+// This uses the patch's existing client-to-client custom message facility (the same one
+// vote-to-end and playersync use), so no server change is needed.
+#define HJ_TEAMPREF_NONE   (-1)
+extern PatchConfig_t config;      // defined in main.c
+extern int hjTeamChoice;          // defined just below, in the s207 block
+static int hjPeerTeamPref[GAME_MAX_PLAYERS];
+static int hjTeamPrefInit = 0;
+static int hjTeamPrefSendTick = 0;
+// s209-D: the ONE place the joiner's wanted team is resolved. -1 = Auto.
+//
+// The pre-join prompt is now the only source. The config option that used to back this
+// was scaffolding: it existed so the host-side plumbing could be tested while the dialog
+// was broken, and it was wrong as a design -- the team is a per-join decision, so a value
+// that persists across joins (or, worse, across boots) is not what anyone wants. Choosing
+// "Auto" in the prompt must also MEAN auto, which a config fallback would quietly
+// override.
+static int hjTeamSelection(void)
+{
+    return hjTeamChoice;
+}
+
+static int hjPrefBlockedLogged = 0;   // s208-D, rearmed on the edge into the game
+static int hjPrefSentLogged    = 0;   // s208-D, ditto
+
+static void hjTeamPrefEnsureInit(void)
+{
+    int i;
+    if (hjTeamPrefInit) return;
+    for (i = 0; i < GAME_MAX_PLAYERS; ++i)
+        hjPeerTeamPref[i] = HJ_TEAMPREF_NONE;
+    hjTeamPrefInit = 1;
+}
+
+int hjOnTeamPrefMsg(void * connection, void * data)
+{
+    HjTeamPref_t msg;
+
+    hjTeamPrefEnsureInit();
+    memcpy(&msg, data, sizeof(msg));
+
+    {
+        // s208-D: log the first receipts UNCONDITIONALLY. The change-gated log below
+        // cannot distinguish "nothing arrived" from "arrived with a value we already
+        // held" -- and "no teampref line on the host" was the whole finding last run.
+        static int rxLogged = 0;
+        if (rxLogged < 12) {
+            ++rxLogged;
+            HOTJOIN_LOG("teampref RX %d: cid=%d team=%d\n",
+                rxLogged, msg.ClientId, msg.Team);
+        }
+    }
+    if (msg.ClientId >= 0 && msg.ClientId < GAME_MAX_PLAYERS
+        && (msg.Team == 0 || msg.Team == 1)) {
+        if (hjPeerTeamPref[msg.ClientId] != msg.Team) {
+            hjPeerTeamPref[msg.ClientId] = msg.Team;
+            HOTJOIN_LOG("teampref: client %d wants team %d\n", msg.ClientId, msg.Team);
+        }
+    }
+    return sizeof(HjTeamPref_t);
+}
+
+// Broadcast our own preference while we are joining and shortly after. Repetition matters:
+// the host must have it before hjHostAdoptPeers writes the slot, and we do not know exactly
+// when that lands. Cheap enough to send at 1 Hz.
+void hjSendTeamPref(void)
+{
+    HjTeamPref_t msg;
+    void * conn;
+    int want;
+
+    hjTeamPrefEnsureInit();
+
+    // -1 = Auto, which never announces, so a player who leaves the prompt alone keeps the
+    // s206 host-side balance untouched.
+    want = hjTeamSelection();
+    {
+        static int wantLogged = -2;
+        if (want != wantLogged) {
+            wantLogged = want;
+            HOTJOIN_LOG("teampref: want=%d (choice=%d host=%d)\n",
+                want, hjTeamChoice, gameAmIHost());
+        }
+    }
+    if (want < 0)
+        return;
+    if (gameAmIHost())              // the host applies its own pick directly
+        return;
+
+    // 15 frames = ~4 Hz. 1 Hz was too slow to be safe: adopt can land within a second of
+    // the peer reaching state 5, and if the preference arrives AFTER adopt the host has
+    // already written the balanced team. Cheap message, so send it often while joining.
+    if (--hjTeamPrefSendTick > 0)
+        return;
+    hjTeamPrefSendTick = 15;
+
+    conn = netGetDmeServerConnection();
+    msg.ClientId = gameGetMyClientId();
+    msg.Team     = want;
+
+    // s208-D DIAGNOSTIC. s208-C capped its log at 12 lines and ALL TWELVE were spent in
+    // the menus, where conn==0 and cid==-1 -- so the run proved only that the config was
+    // read, and said nothing about the window that actually matters (post-adopt, when
+    // conn and cid do exist). Three budgets, because a single one is exactly the trap
+    // s208-C fell into: the menus phase lasts MINUTES (navigating to the lobby, opening
+    // the config menu, finding the game), so any budget shared with the menus is spent
+    // long before the join and proves nothing about the join. The in-game budgets are
+    // therefore rearmed on the EDGE into the game.
+    {
+        static int wasInGame = 0;
+        int nowInGame = isInGame();
+        if (nowInGame && !wasInGame) {
+            hjPrefBlockedLogged = 0;
+            hjPrefSentLogged    = 0;
+            HOTJOIN_LOG("teampref: entered game, diagnostic budgets rearmed\n");
+        }
+        wasInGame = nowInGame;
+    }
+
+    if (!conn || msg.ClientId < 0) {
+        static int blockedTick = 0;
+        if (--blockedTick <= 0) {
+            blockedTick = 8;            // 8 * 15 frames = ~2 s
+            if (hjPrefBlockedLogged < 40) {
+                ++hjPrefBlockedLogged;
+                HOTJOIN_LOG("teampref BLOCKED %d: want=%d cid=%d conn=%08x inGame=%d menus=%d\n",
+                    hjPrefBlockedLogged, want, msg.ClientId, (u32)conn,
+                    isInGame(), isInMenus());
+            }
+        }
+        return;
+    }
+
+    // Send on BOTH paths. netBroadcastCustomAppMessage goes out via
+    // netBroadcastMediusAppMessage; the vote-to-end code in main.c uses the OTHER entry
+    // point, netSendCustomAppMessage(conn, -1, ...), and that one is known to work in
+    // this patch today. Trying only the broadcast is an untested assumption about which
+    // path the DME relays for a client that has just hot-joined -- and s200 showed the
+    // DME treats a hot-joiner's traffic differently from an ordinary client's. Both are
+    // cheap; the two return values say which one, if either, got off the machine.
+    {
+        int host = gameGetHostId();
+        int rcB  = netBroadcastCustomAppMessage(conn, CUSTOM_MSG_ID_HJ_TEAM_PREF,
+                                                sizeof(msg), &msg);
+        // s208-E: also address the host directly, which is exactly what the name sync
+        // (hjSendMyName) does and that one is known to arrive. Keep the broadcast as
+        // well: in staging gameGetHostId() may not be resolved yet.
+        int rcS  = netSendCustomAppMessage(conn, host, CUSTOM_MSG_ID_HJ_TEAM_PREF,
+                                           sizeof(msg), &msg);
+        if (hjPrefSentLogged < 12) {
+            ++hjPrefSentLogged;
+            HOTJOIN_LOG("teampref SENT %d: want=%d cid=%d host=%d conn=%08x rcB=%d rcS=%d inGame=%d menus=%d\n",
+                hjPrefSentLogged, want, msg.ClientId, host, (u32)conn, rcB, rcS,
+                isInGame(), isInMenus());
+        }
+    }
+}
+
+// s208-B: apply a preference that arrived AFTER adopt.
+//
+// The joiner cannot guarantee its broadcast reaches us before hjHostAdoptPeers writes the
+// slot. But the team is not CONSUMED at adopt -- it is consumed when the player object is
+// built, which s206 measured at ~11.3s after adopt (and is why auto-assign gets skin and
+// spawn base right). So a preference landing inside that window can still take effect if we
+// rewrite the roster entry.
+//
+// Host-only, and only while the slot is adopted but not yet spawned.
+void hjHostApplyLateTeamPref(void)
+{
+    GameSettings * gs;
+    int i;
+
+    if (!gameAmIHost() || !isInGame())
+        return;
+    hjTeamPrefEnsureInit();
+
+    gs = gameGetSettings();
+    if (!gs)
+        return;
+
+    for (i = 0; i < GAME_MAX_PLAYERS; ++i) {
+        if (gs->PlayerClients[i] < 0)
+            continue;
+        if (hjPeerTeamPref[i] == HJ_TEAMPREF_NONE)
+            continue;
+        if (gs->PlayerTeams[i] == (short)hjPeerTeamPref[i])
+            continue;
+
+        HOTJOIN_LOG("teampref: LATE apply, slot %d team %d -> %d\n",
+            i, (int)gs->PlayerTeams[i], hjPeerTeamPref[i]);
+        gs->PlayerTeams[i] = (short)hjPeerTeamPref[i];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// s207: PRE-JOIN TEAM SELECTOR.
+//
+// Goal: auto-balance stays the default (s206), but a player may override it to Blue or Red
+// before joining. A hot-joiner has no staging screen -- that is the whole reason it could
+// never pick a team -- so the last UI it owns is the GAME DETAILS screen it is looking at
+// when it presses JOIN. We raise the picker there.
+//
+// The dialog machinery is NOT staging-bound: uiShowSelectDialog renders into the fixed
+// UI_DIALOG_A0 object and consults no staging state. openTeamsOptions only happens to be
+// CALLED from the staging loop; it is not confined to it.
+//
+// This records the CHOICE only. Applying it is separate, because the host writes
+// gs->PlayerTeams[] at adopt time and a joiner's own copy is rebuilt during the join.
+//
+// -1 = auto (host balances, s206), 0 = Blue, 1 = Red.
+int hjTeamChoice = -1;
+static int hjTeamPromptShown = 0;
+static int hjTeamPromptDelay = 0;   // s209-E, frames since GAME_DETAILS opened
+
+// s209-D: GAME_DETAILS can occupy any of the three active-menu slots depending on what it
+// was opened over. Ask all three.
+static int hjGameDetailsOpen(void)
+{
+    int w;
+    for (w = 0; w < 3; ++w)
+        if (uiGetActiveMenu(UI_MENU_GAME_DETAILS, w))
+            return 1;
+    return 0;
+}
+
+void hjTeamSelectPrompt(void)
+{
+    int sel;
+
+    // s209-D: the choice belongs to ONE join. Clear it on the way out of a game, so a
+    // player who hot-joins as Red, leaves, and then takes some other route back in (Quick
+    // Play, an invite -- anything that does not pass through GAME DETAILS) is not silently
+    // still Red. Without this the variable outlives the decision it recorded.
+    {
+        static int wasInGame = 0;
+        int nowInGame = isInGame();
+        if (wasInGame && !nowInGame) {
+            if (hjTeamChoice >= 0)
+                HOTJOIN_LOG("teamsel: left game, choice %d -> auto\n", hjTeamChoice);
+            hjTeamChoice = -1;
+            hjTeamPromptAsked = 0;
+        }
+        wasInGame = nowInGame;
+    }
+
+    // s207-D DIAGNOSTIC. Two axes, not one.
+    //
+    // uiGetActiveMenu(UI, whichMenu) reads *(UI_ACTIVE_MENU_1 + whichMenu*4) and compares
+    // it against uiGetMenu(UI). There are THREE active-menu slots (0x01c5c110/114/118) and
+    // my earlier probes only ever checked slot 0 -- so an all-zero result could have meant
+    // "wrong id" OR "right id, wrong slot", and I could not tell which. Scan both axes, and
+    // log the raw slot pointers too so that even a total miss is diagnosable.
+    {
+        static u32 lastP0 = 0xffffffff, lastP1 = 0xffffffff, lastP2 = 0xffffffff;
+        u32 p0 = *(u32*)0x01c5c110, p1 = *(u32*)0x01c5c114, p2 = *(u32*)0x01c5c118;
+        static int logged = 0;
+
+        if ((p0 != lastP0 || p1 != lastP1 || p2 != lastP2) && logged < 400) {
+            int i, w;
+            lastP0 = p0; lastP1 = p1; lastP2 = p2;
+            ++logged;
+            HOTJOIN_LOG("menuscan: slots = %08x %08x %08x\n", p0, p1, p2);
+            for (w = 0; w < 3; ++w) {
+                for (i = 0; i <= 42; ++i) {
+                    if (uiGetActiveMenu(i, w)) {
+                        HOTJOIN_LOG("menuscan:   id %d ACTIVE in slot %d\n", i, w);
+                        ++logged;
+                    }
+                }
+            }
+        }
+    }
+
+    // s209-D: check ALL THREE active-menu slots, not slot 0.
+    //
+    // This one wrong index is why the dialog never fired in any build. The s207-D scan
+    // above finally showed why, decoded against the menu enum:
+    //     [407.68] slots = 01d86248 01d40578 00000000
+    //                id 31 (CITY) ACTIVE in slot 0
+    //                id 32 (UNK_2) ACTIVE in slot 0
+    //                id 16 (GAME_DETAILS) ACTIVE in slot 1   <-- GAME INFO
+    // GAME_DETAILS opens OVER the city screen, so the city keeps slot 0 and the details
+    // menu lands in slot 1. Nothing about the gate was conceptually wrong; it was
+    // looking at the wrong one of three places.
+    if (!hjGameDetailsOpen()) {
+        // Rearm whenever we are not on the screen, so re-entering the game list asks
+        // again rather than silently reusing a choice made for a different game.
+        hjTeamPromptShown = 0;
+        hjTeamPromptDelay = 0;
+        return;
+    }
+    // s209-G: the dialog is NOT raised from here any more.
+    //
+    // Calling uiShowSelectDialog from main() wedges the patch. Measured: with the slot
+    // gate fixed the prompt did fire, but the last HJ log line of ANY kind was t=376.03,
+    // and 40 s of game time later the EE was still running and rendering while our
+    // per-frame hook had never executed again. The call does not return. The first two
+    // builds hid this by taking the immediate -1 as an answer and never calling twice.
+    //
+    // Every working uiShowSelectDialog call site in this patch (openTeamsOptions,
+    // openPlayerOptions) runs inside patchStaging(ui, pad) -- a pad handler, where the
+    // UI owns the frame. main() is not that context. The prompt now lives in
+    // patchStaging; see hjStagingTeamPrompt.
+    //
+    // What survives here is the rearm bookkeeping: being on GAME DETAILS means the
+    // player is picking a game, so the next staging entry must ask again.
+    // s210-B: arm on the EDGE into GAME DETAILS, not every frame while it is open.
+    //
+    // The level-triggered version looped: the dialog blocks, so main() does not run while
+    // it is up; the moment it returns, this line saw GAME DETAILS still open, cleared the
+    // flag, and patchGameDetails raised the dialog again. Measured -- "raising prompt from
+    // GAME DETAILS" at 383.39, answered at 429.17, raised again at 429.57.
+    {
+        static int wasOnDetails = 0;
+        int nowOnDetails = hjGameDetailsOpen();
+        if (nowOnDetails && !wasOnDetails)
+            hjTeamPromptAsked = 0;
+        wasOnDetails = nowOnDetails;
+    }
+}
+
+// s207: the joiner IMPOSES its chosen team, every frame, while in game.
+//
+// The host writes gs->PlayerTeams[] at adopt and re-broadcasts settings periodically, so a
+// single write from the joiner could be overwritten. Reasserting per frame is what makes an
+// explicit choice stick regardless of what the host decides -- which is the behaviour asked
+// for: auto is the default, but a player who picks Blue or Red gets it.
+//
+// Deliberately does nothing when the choice is "auto" (-1), so the s206 host-side balance
+// remains the sole authority in the default case.
+void hjApplyTeamChoice(void)
+{
+    static int logged = -2;
+    GameSettings * gs;
+    int cid;
+
+    int choice = hjTeamSelection();
+
+    if (choice < 0)                             // auto -- let the host balance
+        return;
+    if (!isInGame() || isInMenus()) {
+        logged = -2;                            // rearm the one-shot log for the next game
+        return;
+    }
+    if (gameAmIHost())                          // host applied it in hjPickTeamForJoiner
+        return;
+
+    gs = gameGetSettings();
+    if (!gs)
+        return;
+    cid = gameGetMyClientId();
+    if (cid < 0 || cid >= GAME_MAX_PLAYERS)
+        return;
+
+    if (gs->PlayerTeams[cid] != (short)choice) {
+        gs->PlayerTeams[cid] = (short)choice;
+        if (logged != choice) {
+            HOTJOIN_LOG("teamsel: joiner imposed team %d on slot %d\n", choice, cid);
+            logged = choice;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// s206: pick a team for a late joiner instead of hardcoding Blue.
+//
+// WHY THIS EXISTS. Every hot-joiner landed on team 0, and the cause was not that staging's
+// bulk setTeams() fails to reach late arrivals -- it is that hjHostAdoptPeers below wrote
+// `gs->PlayerTeams[i] = 0;` outright at the moment it admitted them. Measured on three
+// machines in a live CTF match: teams = 0 0 0, confirmed from the game's own settings
+// struct (gs+0xd0) as well as our roster log, with mode_id=1 (CTF). There is NO in-game
+// route to a team selector for anyone -- the pause menu is PATCH CONFIG / OPTIONS / QUIT,
+// OPTIONS holds only CONTROLS-CAMERA and AUDIO-VISUAL, and the external tooling is gated
+// on the staging screen in code -- so a hot-joiner could never correct it either. In a CTF
+// match that means late joiners can only ever reinforce one side.
+//
+// The adopt-time write is known to PROPAGATE: the hardcoded 0 is what every client read,
+// which is why all three machines agreed on Blue. So a chosen value written here reaches
+// everyone by the same path, with no new plumbing and no protocol change.
+//
+// Tie goes to team 0, so a joiner entering a game where the host sits alone on team 0 is
+// placed on 1 -- the empty side -- which is the behaviour we want.
+static int hjPickTeamForJoiner(GameSettings * gs, int newSlot)
+{
+    int j, n0 = 0, n1 = 0;
+
+    // Non-team modes: leave the vanilla value. setTeams() uses this field differently when
+    // teams are off (FFA assigns teamId = slot index), so balancing it would be wrong.
+    if (!gameGetOptions()->GameFlags.MultiplayerGameFlags.Teams)
+        return 0;
+
+    // s208: honour a preference the joiner announced, if one arrived before adopt. This is
+    // the ONLY way an explicit choice can work -- see the comment above hjSendTeamPref.
+    hjTeamPrefEnsureInit();
+    if (newSlot >= 0 && newSlot < GAME_MAX_PLAYERS
+        && hjPeerTeamPref[newSlot] != HJ_TEAMPREF_NONE) {
+        HOTJOIN_LOG("teampref: honouring client %d request for team %d\n",
+            newSlot, hjPeerTeamPref[newSlot]);
+        return hjPeerTeamPref[newSlot];
+    }
+
+    // s207 NOTE: deliberately does NOT consult hjTeamChoice. This runs on the HOST, where
+    // hjTeamChoice is the HOST's own pick -- if the host had ever opened GAME DETAILS it
+    // would stamp its preference onto every joiner that arrived. The joiner imposes its own
+    // choice locally in hjApplyTeamChoice instead, which is also what makes the override
+    // work without the host needing to know anything about it.
+    //
+    // So the host ALWAYS balances here, and that is the right default: the host is the only
+    // machine that reliably knows the current team sizes.
+
+    for (j = 0; j < GAME_MAX_PLAYERS; ++j) {
+        if (j == newSlot || gs->PlayerClients[j] < 0)
+            continue;
+        if (gs->PlayerTeams[j] == 1)      ++n1;
+        else if (gs->PlayerTeams[j] == 0) ++n0;
+    }
+
+    return (n1 < n0) ? 1 : 0;
+}
+
 void hjHostAdoptPeers(void)
 {
     GameSettings * gs = gameGetSettings();
@@ -1698,7 +2207,7 @@ void hjHostAdoptPeers(void)
 
         gs->PlayerClients[i] = (short)i;
         gs->PlayerStates[i]  = gs->PlayerStates[*(int*)(peers + 0x404)];
-        gs->PlayerTeams[i]   = 0;
+        gs->PlayerTeams[i]   = (short)hjPickTeamForJoiner(gs, i);   // s206, was hardcoded 0
         gs->PlayerSkins[i]   = 0;
         gs->PlayerTypes[i]   = 0;
         // Deliberately DO NOT write a name here. The placeholder that used to live at
@@ -1713,6 +2222,7 @@ void hjHostAdoptPeers(void)
         // actually registered under.
         gs->PlayerCount = count + 1;
         hjAdopted |= (1 << i);
+        HOTJOIN_LOG("adopt: slot %d team -> %d (s206 auto-assign)\n", i, (int)gs->PlayerTeams[i]);
         HOTJOIN_LOG("adopt: host wrote roster slot %d (client %d, state %d), n -> %d\n",
             i, i, gs->PlayerStates[i], gs->PlayerCount);
     }
@@ -1904,7 +2414,9 @@ void hjHostRefreshNames(void)
 // snapshot (section 67), but the host's blank name can propagate back over the
 // host's settings broadcast -- so latch the first non-empty name seen and keep
 // sending that, rather than re-reading a field that may have been blanked.
-#define CUSTOM_MSG_ID_HOTJOIN_NAME  (32)
+// s208-E: CUSTOM_MSG_ID_HOTJOIN_NAME now lives in common/messageid.h. It was defined
+// here as 32, which silently collided with CUSTOM_MSG_ID_HJ_TEAM_PREF -- see the note
+// on the enum.
 #define HJ_NAME_SENDS               (30)   // ~30 s, once a second
 
 typedef struct HjNameMsg {
@@ -4639,11 +5151,22 @@ void hjInstallPlayerBitGuard(void)
     HOTJOIN_LOG("build: " HJ_BUILD_TAG "\n");
 }
 #else
+// s207: PAL stubs. The selector and its apply live in the NTSC block above, so without
+// these the PAL link fails on main.c's references -- and because bin/ is bind-mounted, a
+// failed build DELETES the served artifact. (It did: patch-10683.bin was removed.)
+int hjTeamChoice = -1;
+void hjTeamSelectPrompt(void) { }
+void hjApplyTeamChoice(void) { }
+void hjSendTeamPref(void) { }
+void hjHostApplyLateTeamPref(void) { }
+int  hjOnTeamPrefMsg(void * connection, void * data) { return sizeof(HjTeamPref_t); }
+
 void hjInstallPlayerBitGuard(void) { }
 void hjInstallAuxAcceptProbe(void) { }
 void hjFixMissingPads(void) { }
 void hjDumpDispatch(void) { }
 void hjAnnounce(void) { }
+void hjLogWhere(void) { }           // s211
 void hjDumpRoster(void) { }
 void hjDumpNWPlayers(void) { }
 void hjHostSpawnRemotes(void) { }
@@ -5082,6 +5605,79 @@ void openTeamsOptions(GameSettings * gs, int isTeams)
         setTeams(select);
 }
 // extern forceMapOverride;
+// ---------------------------------------------------------------------------
+// s210: raise the team prompt BEFORE the join request, on GAME DETAILS.
+//
+// s209-G put it on STAGING, which works but is the wrong place: by then the join is
+// already in flight -- the joiner is connected to DME, the host is waiting on the peer
+// sequence, and a countdown is running. uiShowSelectDialog BLOCKS, so holding staging
+// holds all of that (main() does not run either, so hjAnnounce stops sending). It
+// survived a 49 s block in testing, but "it happened to be fine" is not a property.
+//
+// On GAME DETAILS nothing is pending: the player is sitting in a menu, and the choice is
+// simply in hand when they press JOIN. Blocking there costs nothing.
+//
+// The game dispatches each menu through a vtable whose `update` sits at +0x14; main.c
+// installs patchStaging by poking that slot at a hardcoded address. There is no such
+// constant for GAME DETAILS, so derive the slot at runtime from the menu object
+// (UiMenu_t.vTable, +0x60) -- and SELF-CHECK the derivation against the one address we
+// do know, staging's. If `stagingVt + 0x14` does not equal the known constant then the
+// +0x60 assumption is wrong, and we log and install nothing rather than poke a guess
+// into executable dispatch.
+static int (*hjOrigGameDetailsUpdate)(UiMenu_t*, int) = 0;
+
+int patchGameDetails(UiMenu_t* ui, int pad)
+{
+    if (!hjTeamPromptAsked) {
+        int sel;
+        hjTeamPromptAsked = 1;
+        HOTJOIN_LOG("teamsel: raising prompt from GAME DETAILS\n");
+        sel = uiShowSelectDialog("Join Team", hjTeamChoiceOptions, 3, 0);
+        hjTeamChoice = (sel <= 0) ? -1 : (sel - 1);
+        HOTJOIN_LOG("teamsel: choice -> %d (%s), raw sel %d\n", hjTeamChoice,
+            (hjTeamChoice < 0) ? "auto" : ((hjTeamChoice == 0) ? "blue" : "red"), sel);
+    }
+
+    if (hjOrigGameDetailsUpdate)
+        return hjOrigGameDetailsUpdate(ui, pad);
+    return 0;
+}
+
+void hjInstallGameDetailsHook(u32 stagingUpdateSlot)
+{
+    static int state = 0;           // 0 = not yet, 1 = installed, 2 = disproven
+    UiMenu_t * stg;
+    UiMenu_t * det;
+    u32 svt, dvt, slot;
+
+    if (state)
+        return;
+
+    stg = uiGetMenu(UI_MENU_STAGING);
+    det = uiGetMenu(UI_MENU_GAME_DETAILS);
+    if (!stg || !det)
+        return;                     // menus not built yet; try again next frame
+
+    svt = *(u32*)((u32)stg + 0x60);
+    dvt = *(u32*)((u32)det + 0x60);
+
+    if (svt + 0x14 != stagingUpdateSlot) {
+        state = 2;
+        HOTJOIN_LOG("uihook: DISPROVEN -- staging vt %08x +0x14 != known %08x; "
+                    "leaving dispatch alone (details vt %08x)\n",
+            svt, stagingUpdateSlot, dvt);
+        return;
+    }
+
+    slot = dvt + 0x14;
+    hjOrigGameDetailsUpdate = *(int (**)(UiMenu_t*, int))slot;
+    POKE_U32(slot, (u32)&patchGameDetails);
+    state = 1;
+    HOTJOIN_LOG("uihook: GAME_DETAILS update slot %08x -> patchGameDetails "
+                "(orig %08x, verified against staging %08x)\n",
+        slot, (u32)hjOrigGameDetailsUpdate, stagingUpdateSlot);
+}
+
 int patchStaging(UiMenu_t* ui, int pad)
 {
     static int init_staging = 0;
@@ -5097,6 +5693,16 @@ int patchStaging(UiMenu_t* ui, int pad)
     int itemSelected = *(int*)((u32)ui + 0x290);
     int isLoading = *(u8*)((u32)ui + 0x2b6);
     int isRequstingTeamChange = *(u8*)((u32)ui + 0x2c8);
+
+    // s210-C: there is NO staging fallback, and there should not be one.
+    //
+    // s210 kept the prompt here as a backstop for routes that skip GAME DETAILS. The user
+    // established that no such route exists: an invite is impossible from in-game, and
+    // Quick Play only brings you to the game listing -- it never joins directly. Every
+    // hot-join passes through GAME DETAILS, so the backstop was dead code that could only
+    // ever misfire, and misfiring means blocking a staging screen with a live join in
+    // flight, which is exactly what s210 moved the prompt away from. Deleted rather than
+    // left dormant.
 
     // Hot-join instrumentation (temporary): fires on entry, before any early return,
     // so we can tell "staging never entered" apart from "logging not working".
