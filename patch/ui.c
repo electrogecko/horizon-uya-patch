@@ -162,7 +162,7 @@ extern mapOverrideResponse;
 // Bump by hand for any build handed to a tester, and identify rounds by this string. An md5
 // still identifies a build on the SERVER machine, where the file exists and the bind mount
 // can be verified; the tag is the only identifier available on a client.
-#define HJ_BUILD_TAG   "20261011k-where"
+#define HJ_BUILD_TAG   "20261017c-teamlog"
 
 // ---------------------------------------------------------------------------
 // Hotjoin: guard the per-player registration that faults for a late joiner.
@@ -1486,6 +1486,7 @@ int hjAdopted = 0;                 // bitmask of slots we have already written
 #define HJ_NWPLAYER_STRIDE (0xC70)
 #define HJ_NW_SEQ          (0xc34)
 #define HJ_NW_PDATA        (0x04)
+#define HJ_NW_NAME         (0x1b0)   // s224: needed by the release path, see below
 
 // Slots reaped and not yet proven to have come back, plus the tNW_Player sequence
 // each held at the moment it was reaped. See hjHostAdoptPeers for why.
@@ -1606,6 +1607,21 @@ void hjReleaseRemoteSlot(int cid, GameSettings * gs, const char * why)
 
     *(u32*)(nwp + HJ_NW_PDATA) = 0;
     *(int*)(nwp + HJ_NW_SEQ) = 0;
+
+    // s224. Clearing gs->PlayerNames above is NOT enough. hjHostRefreshNames copies
+    // nwp+0x1b0 back into the roster every frame for every occupied non-self slot, so
+    // leaving the departed player's name here means the NEXT occupant of this slot
+    // inherits it. The joiner's own hjSendMyName does fight back, producing an
+    // alternating correct/stale pair in the log, but HJ_NAME_SENDS is finite: the
+    // corrections run out and the cycle terminates on the STALE value. Worse, it is not
+    // host-local -- a client joining later reads the stale string in its own freshly
+    // built nw record, so it propagates through the bootstrap data.
+    //
+    // Observed 2026-10-16: maxMac3 left, maxTest2 took slot 1, and every client in the
+    // match -- including one that joined afterwards and never saw the departure --
+    // called maxTest2 'maxMac3' permanently.
+    for (k = 0; k < 16; ++k)
+        *(char*)(nwp + HJ_NW_NAME + k) = 0;
 
     HOTJOIN_LOG("release: slot %d done, n -> %d, adopt+spawn latches rearmed\n", cid, n);
 }
@@ -2276,7 +2292,13 @@ void hjHostAdoptPeers(void)
         // actually registered under.
         gs->PlayerCount = count + 1;
         hjAdopted |= (1 << i);
-        HOTJOIN_LOG("adopt: slot %d team -> %d (s206 auto-assign)\n", i, (int)gs->PlayerTeams[i]);
+        // s231: this used to print "(s206 auto-assign)" UNCONDITIONALLY, including when the
+        // team came from an honoured preference. That label cost real time: a reader seeing
+        // auto-assign fire on an explicitly-chosen join reasonably concluded the pick was
+        // being overridden, when in fact hjHostTeamForSlot had already returned the
+        // preference. Say which source actually supplied the value.
+        HOTJOIN_LOG("adopt: slot %d team -> %d (%s)\n", i, (int)gs->PlayerTeams[i],
+            hjPeerTeamPref[i] != HJ_TEAMPREF_NONE ? "client preference" : "s206 auto-assign");
         HOTJOIN_LOG("adopt: host wrote roster slot %d (client %d, state %d), n -> %d\n",
             i, i, gs->PlayerStates[i], gs->PlayerCount);
     }
@@ -2402,6 +2424,12 @@ void hjDumpNWPlayers(void)
 // not yet populated leaves the roster alone instead of writing garbage into it.
 #define HJ_NW_NAME  (0x1b0)
 
+// s227: slots we have watched become occupied. Cleared when we scrub the slot, so the
+// scrub runs exactly once per occupied -> vacant transition and never on a slot that
+// was never occupied. See the long note in the loop below for why "every frame while
+// the byte is non-zero" was not safe.
+static int hjNameSeen = 0;
+
 void hjHostRefreshNames(void)
 {
     GameSettings * gs;
@@ -2419,7 +2447,53 @@ void hjHostRefreshNames(void)
         u32 nm = HJ_NWPLAYER_BASE + (i * HJ_NWPLAYER_STRIDE) + HJ_NW_NAME;
         int k, len = -1, differs = 0;
 
-        if (i == me || gs->PlayerClients[i] < 0)
+        // s225. Clearing nwp+0x1b0 in hjReleaseRemoteSlot was NOT enough, because on the
+        // HOST that function never runs for an ordinary departure. hjPeerClosedRemote
+        // computes `eligible = spawned && pData && ...` and the host reaches it with
+        // pData already 0, so it returns early (logged as elig=0) and the ENGINE does the
+        // whole slot clear by itself -- which is also why PlayerSkins comes back as the
+        // engine's -1 sentinel rather than our 0 (correcting the s224 reading). The engine
+        // clears gs but leaves nwp+0x1b0 alone, so the stale name sat there and was stomped
+        // onto the next occupant from right here.
+        //
+        // Measured 2026-10-16 on 20261016a-nwname, with the release-path clear in place:
+        //     [431.8923] peerclosed: idx=1 ... spawned=1 pData=00000000 ... elig=0
+        //                nwp[1]+0x1b0 = 'maxMac3\x00...'        <- never cleared
+        //     [492.1325] name: roster slot 1 -> 'maxMac3' (from nwp +0x1b0)
+        //
+        // So do it HERE instead: this function is host-gated, runs every frame, and already
+        // walks every slot.
+        //
+        // s227 -- HARDENED, and the first version was dangerous. It cleared whenever the
+        // byte was non-zero and LOGGED EVERY TIME, inside a per-frame loop. Two faults:
+        //
+        //   1. If anything rewrites that field for a vacant slot -- and the note above
+        //      says +0x1b0 MIRRORS THE LOCAL ROSTER, i.e. the engine writes it -- then we
+        //      clear, it rewrites, we clear again, and we emit a console line every frame.
+        //      HOTJOIN_LOG is a synchronous console write. At 60 fps that is a freeze.
+        //      s228: the host went silent 23 s after a hot-join attached, process alive and
+        //      memory coherent but the game loop dead. That is the shape this would make.
+        //   2. Slots 3..7 are ALWAYS vacant. Non-zero garbage in any of them meant writing
+        //      into tNW_Player entries that were never ours, every frame, forever.
+        //
+        // Both go away by latching on the OCCUPIED -> VACANT transition. We only ever touch
+        // a slot we watched become occupied, exactly once per departure, and a slot that was
+        // never occupied is never written at all. Unbounded work in a per-frame hook is how
+        // this file has caused trouble before; see the HJ_PEERCLOSE_MAX safety valve.
+        if (gs->PlayerClients[i] < 0) {
+            if (hjNameSeen & (1 << i)) {
+                u32 nmv = HJ_NWPLAYER_BASE + (i * HJ_NWPLAYER_STRIDE) + HJ_NW_NAME;
+                hjNameSeen &= ~(1 << i);
+                for (k = 0; k < 16; ++k) *(char*)(nmv + k) = 0;
+                HOTJOIN_LOG("name: slot %d vacant, cleared stale nwp +0x%x\n",
+                    i, HJ_NW_NAME);
+            }
+            continue;
+        }
+
+        hjNameSeen |= (1 << i);
+
+        if (i == me)
             continue;
 
         for (k = 0; k < 16; ++k) {
@@ -5773,12 +5847,42 @@ int patchGameDetails(UiMenu_t* ui, int pad)
 
 void hjInstallGameDetailsHook(u32 stagingUpdateSlot)
 {
-    static int state = 0;           // 0 = not yet, 1 = installed, 2 = disproven
+    // s216: this used to latch on a `static int state` and install EXACTLY ONCE per boot.
+    // Measured 2026-10-14: the team prompt fired on the first join of a session and never
+    // again. Three GAME_DETAILS visits, one `raising prompt` line, one `uihook` line --
+    // and `hjTeamPromptAsked` was definitely cleared, because `left game, choice 1 -> auto`
+    // fired in between. So the flag was not the problem: patchGameDetails simply stopped
+    // being called, i.e. the vtable slot no longer pointed at us.
+    //
+    // The menu object is rebuilt across a game session, which restores the original update
+    // pointer. A once-only install cannot survive that. So verify the slot every frame and
+    // re-install whenever it is not ours. Cheap: two pointer loads and a compare.
+    //
+    // User-visible symptom this fixes: the team choice is supposed to be a PER-JOIN
+    // decision, and it was silently unavailable on every join after the first.
+    static int disproven = 0;
+    static int installs  = 0;
     UiMenu_t * stg;
     UiMenu_t * det;
-    u32 svt, dvt, slot;
+    u32 svt, dvt, slot, cur;
 
-    if (state)
+    if (disproven)
+        return;
+
+    // s216-C: the menu objects DO NOT EXIST while a game is running, and uiGetMenu() hands
+    // back DANGLING pointers into memory the level has since reused. Reading a vTable
+    // through one of those is meaningless.
+    //
+    // Measured twice, and the second reading is what gave it away:
+    //   ee=591.16  staging vt 00000000, details vt 00000000   (mid-teardown)
+    //   ee=472.39  staging vt 382d8d08, details vt 382d8d08   (reused memory)
+    // Two distinct menu objects cannot share a vTable pointer, so 382d8d08 is not a layout
+    // we failed to recognise -- it is whatever the level put there. s216-B only skipped the
+    // zero case, so the garbage case still latched `disproven` and killed the prompt.
+    //
+    // The right condition is not "is this value plausible" but "do these objects exist",
+    // and they exist exactly when we are in the menus.
+    if (!isInMenus())
         return;
 
     stg = uiGetMenu(UI_MENU_STAGING);
@@ -5789,8 +5893,21 @@ void hjInstallGameDetailsHook(u32 stagingUpdateSlot)
     svt = *(u32*)((u32)stg + 0x60);
     dvt = *(u32*)((u32)det + 0x60);
 
+    // s216-B: a menu object can be non-NULL while its vTable field reads 0 -- it exists but
+    // is mid-build or mid-teardown. Measured: during the join at ee=591.16 BOTH vtables read
+    // 00000000 while the menus were torn down for the level load.
+    //
+    // The first version of this re-check treated that as a layout disagreement and latched
+    // `disproven`, permanently killing the hook on the first join -- worse than the
+    // once-only install it replaced. A zero vTable is NOT "the layout is wrong", it is "not
+    // ready yet", exactly like the NULL check above. Retry next frame.
+    if (!svt || !dvt)
+        return;
+
+    // Self-check against a constant we know, before poking dispatch. Permanent stop: if the
+    // layout is genuinely DIFFERENT (non-zero and not what we expect), never write.
     if (svt + 0x14 != stagingUpdateSlot) {
-        state = 2;
+        disproven = 1;
         HOTJOIN_LOG("uihook: DISPROVEN -- staging vt %08x +0x14 != known %08x; "
                     "leaving dispatch alone (details vt %08x)\n",
             svt, stagingUpdateSlot, dvt);
@@ -5798,12 +5915,19 @@ void hjInstallGameDetailsHook(u32 stagingUpdateSlot)
     }
 
     slot = dvt + 0x14;
-    hjOrigGameDetailsUpdate = *(int (**)(UiMenu_t*, int))slot;
+    cur  = *(u32*)slot;
+
+    if (cur == (u32)&patchGameDetails)
+        return;                     // already ours; the common case, costs a compare
+
+    // Never store our own pointer as "the original" -- that would recurse forever. The
+    // check above guarantees cur != patchGameDetails here.
+    hjOrigGameDetailsUpdate = (int (*)(UiMenu_t*, int))cur;
     POKE_U32(slot, (u32)&patchGameDetails);
-    state = 1;
+    ++installs;
     HOTJOIN_LOG("uihook: GAME_DETAILS update slot %08x -> patchGameDetails "
-                "(orig %08x, verified against staging %08x)\n",
-        slot, (u32)hjOrigGameDetailsUpdate, stagingUpdateSlot);
+                "(orig %08x, verified against staging %08x) install #%d\n",
+        slot, cur, stagingUpdateSlot, installs);
 }
 
 int patchStaging(UiMenu_t* ui, int pad)
