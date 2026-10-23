@@ -162,7 +162,7 @@ extern mapOverrideResponse;
 // Bump by hand for any build handed to a tester, and identify rounds by this string. An md5
 // still identifies a build on the SERVER machine, where the file exists and the bind mount
 // can be verified; the tag is the only identifier available on a client.
-#define HJ_BUILD_TAG   "20261017c-teamlog"
+#define HJ_BUILD_TAG   "20261021d-stagingguard"
 
 // ---------------------------------------------------------------------------
 // Hotjoin: guard the per-player registration that faults for a late joiner.
@@ -1222,6 +1222,54 @@ static const char * hjMenuName(int id)
     }
 }
 
+// s233-TEST: force gameConfig.grNewPlayerSync on, for the s226 experiment ONLY.
+//
+// s226 says a late-joining client builds remote players from defaults and an idle or dead
+// player never corrects it. playerSyncBroadcastPlayerState sends full state (GadgetId,
+// State, Health, position) on a RATE TICKER rather than on change, so with that system
+// running an idle player keeps re-broadcasting and a joiner is corrected within one
+// interval -- i.e. s226 should not happen at all. But playerSyncTick returns immediately
+// unless this flag is set, `case 5: // Siege` sets it to 0 ("Off in case of vehicles"),
+// and every s226 observation was in Siege. Live read confirmed 0.
+//
+// The flag has to be on for BOTH parties -- the sender to broadcast and the receiver to
+// handle (playerSyncOnReceivePlayerState returns early when it is clear) -- and the config
+// menu's tab navigation could not be driven, so force it here instead of fighting the UI.
+// Forcing it in the patch also keeps the diagnostic honest: a read of gameConfig+43 shows
+// the value actually in effect.
+//
+// THIS DEFINE MUST BE 0 IN ANY BUILD THAT IS COMMITTED. It overrides a deliberate
+// per-mode setting whose comment warns about vehicles, which Siege has.
+#define HJ_TEST_FORCE_PLAYERSYNC   (0)
+
+extern PatchGameConfig_t gameConfig;    // defined in config.c
+
+void hjTestForceSync(void)
+{
+#if HJ_TEST_FORCE_PLAYERSYNC
+    static int said = 0, tick = 0, forced = 0;
+    if (!isInGame())
+        return;
+    // Re-force every frame: if something stomps it back we want to win, and we want to see
+    // the fight in the log rather than infer it.
+    if (!gameConfig.grNewPlayerSync) {
+        gameConfig.grNewPlayerSync = 1;
+        ++forced;
+    }
+
+    // Report the VALUE AND THE ADDRESS from inside the patch, ~every 5 s. An external read
+    // of a symbol address taken from the ELF is an assumption; this is not. If the address
+    // printed here differs from the one being read externally, that explains an external
+    // read of 0 while the patch believes it has set 1 -- which is exactly the situation
+    // this is here to resolve.
+    if (!said || ++tick >= 300) {
+        tick = 0; said = 1;
+        HOTJOIN_LOG("TEST: grNewPlayerSync=%d &gameConfig=%08x forced=%d (s226, not for commit)\n",
+            (int)gameConfig.grNewPlayerSync, (u32)&gameConfig, forced);
+    }
+#endif
+}
+
 void hjLogWhere(void)
 {
     static int lastTop = -2;
@@ -1235,6 +1283,8 @@ void hjLogWhere(void)
             for (i = 0; i <= 42; ++i)
                 if (uiGetActiveMenu(i, w)) { top = i; break; }
     }
+
+    hjTestForceSync();
 
     if (top == lastTop && ig == lastIn)
         return;
@@ -2028,6 +2078,20 @@ void hjTeamSelectPrompt(void)
         // again rather than silently reusing a choice made for a different game.
         hjTeamPromptShown = 0;
         hjTeamPromptDelay = 0;
+        // s239: AND the latch that actually gates the prompt. This block already said
+        // "rearm whenever we are not on the screen" and then rearmed two OTHER flags,
+        // leaving hjTeamPromptAsked -- the one patchGameDetails tests -- untouched.
+        //
+        // This is also why the s232 fix did nothing: that block sits BELOW this early
+        // return, so when the player backs out to CITY and hjGameDetailsOpen() goes
+        // false, we return here and never reach it. Measured 2026-10-21 on two
+        // independent clients: prompt appears on first open, never again on reopen.
+        // My fix was correct code placed where it could not run -- the same mistake as
+        // s225, where the nwp clear sat in a function the host never calls.
+        //
+        // Cannot loop (the s210-B failure): while the dialog is up, GAME_DETAILS is
+        // still in an active slot, so hjGameDetailsOpen() is true and we never get here.
+        hjTeamPromptAsked = 0;
         return;
     }
     // s209-G: the dialog is NOT raised from here any more.
@@ -2051,12 +2115,41 @@ void hjTeamSelectPrompt(void)
     // it is up; the moment it returns, this line saw GAME DETAILS still open, cleared the
     // flag, and patchGameDetails raised the dialog again. Measured -- "raising prompt from
     // GAME DETAILS" at 383.39, answered at 429.17, raised again at 429.57.
+    //
+    // s232: ARM ON LEAVING THE SCREEN, not on arriving at it. The edge above used
+    // hjGameDetailsOpen(), which is true if GAME_DETAILS sits in ANY of the three
+    // active-menu slots -- and backing out to CITY leaves it registered in one. So
+    // nowOnDetails never went false, there was no rising edge, and the prompt never
+    // re-armed. Measured 2026-10-17: three entries into GAME DETAILS produced ONE prompt.
+    //
+    //     [430.2352] teamsel: raising prompt from GAME DETAILS
+    //     [433.2567] teamsel: choice -> -1 (auto)
+    //     [494.1320] where: GAME_DETAILS (id 16)      <- no prompt
+    //     [612.2334] where: GAME_DETAILS (id 16)      <- no prompt
+    //
+    // The `where` trace settles the mechanism without a raw slot read: the TOPMOST menu
+    // went 16 -> 36 -> 31 -> 16, so a topmost-based edge would have fired. It did not
+    // re-arm, and this is the only re-arm on this path, therefore hjGameDetailsOpen()
+    // never went false. That matters because the prompt is the ONLY way a hot-joiner
+    // picks a team -- they have no staging screen -- so one stray dismissal locked a
+    // player to Auto for the rest of the session with no sign anything was wrong.
+    //
+    // Arming on the topmost menu becoming GAME_DETAILS would reintroduce the s210-B loop,
+    // because the blocking dialog is itself the topmost menu while it is up and the
+    // screen goes 16 -> 37 -> 16 on every answer. So arm when the player is definitively
+    // somewhere ELSE: a city or lobby screen. Selecting the game from the lobby therefore
+    // always re-raises the prompt, which is the required behaviour, and answering it
+    // cannot re-trigger it.
     {
-        static int wasOnDetails = 0;
-        int nowOnDetails = hjGameDetailsOpen();
-        if (nowOnDetails && !wasOnDetails)
+        int w, i, top = -1;
+        if (isInMenus()) {
+            for (w = 2; w >= 0 && top < 0; --w)
+                for (i = 0; i <= 42; ++i)
+                    if (uiGetActiveMenu(i, w)) { top = i; break; }
+        }
+        if (top == UI_MENU_CITY || top == UI_MENU_CITY_SELECT
+            || top == UI_MENU_ONLINE_LOBBY)
             hjTeamPromptAsked = 0;
-        wasOnDetails = nowOnDetails;
     }
 }
 
@@ -5845,6 +5938,22 @@ int patchGameDetails(UiMenu_t* ui, int pad)
     return 0;
 }
 
+// s237: a pointer we are about to dereference must be inside EE RAM and aligned.
+// uiGetMenu() returning non-NULL is NOT sufficient -- see the note in the function below.
+// Mask off the segment bits first: the EE reaches the same 32 MB through cached
+// (0x00......), uncached (0x20......) and uncached-accelerated (0x30......) mirrors,
+// and a legitimate object can be handed to us through any of them. Testing the raw
+// value would FALSELY REJECT a valid pointer and silently stop installing the hook --
+// which would look exactly like a successful fix, since the storm would also stop.
+// Mask is 0x0FFFFFFF, not 0x1FFFFFFF: on the EE the mirrors are 0x20...... and
+// 0x30......, and 0x1FFFFFFF leaves the 0x10000000 bit of the UCA mirror set, which
+// false-rejects it. Caught by a table test before this ever ran. Real rejections all
+// survive: 382d8d08 -> 082d8d08, 3c08b50f -> 0c08b50f and
+// 6c03bc00 -> 0c03bc00 are all still past the end of RAM.
+#define HJ_PLAUSIBLE_EE_PTR(p)  ((((u32)(p)) & 0x0FFFFFFFu) >= 0x00100000u \
+                                 && (((u32)(p)) & 0x0FFFFFFFu) < 0x02000000u \
+                                 && ((((u32)(p)) & 3u) == 0u))
+
 void hjInstallGameDetailsHook(u32 stagingUpdateSlot)
 {
     // s216: this used to latch on a `static int state` and install EXACTLY ONCE per boot.
@@ -5889,6 +5998,43 @@ void hjInstallGameDetailsHook(u32 stagingUpdateSlot)
     det = uiGetMenu(UI_MENU_GAME_DETAILS);
     if (!stg || !det)
         return;                     // menus not built yet; try again next frame
+
+    // s237: NULL IS NOT THE ONLY BAD POINTER. uiGetMenu() can hand back a DANGLING
+    // non-NULL pointer -- s216-C already caught it returning 382d8d08 for two distinct
+    // menus at once, which is reused level memory, not a menu. The !stg || !det check
+    // above passes such a pointer straight through to the two loads below.
+    //
+    // Measured 2026-10-19, in an ORDINARY game with no testing involved:
+    //     TLB Miss, pc=0xe33f8 addr=0x3c08b56f [load]
+    //     TLB Miss, pc=0xe33f8 addr=0x6c03bc60 [load]
+    // repeating EVERY FRAME. Those are exactly our two loads: 0x3c08b56f - 0x60 and
+    // 0x6c03bc60 - 0x60 are the stg and det pointers, both wild, both non-NULL.
+    //
+    // And it NEVER STOPS, because of the s216-B guard below. A TLB-missed load reads 0,
+    // so `if (!svt || !dvt) return;` takes the early return before `disproven` can latch
+    // -- and we come back and fault again next frame, forever. (Deductive: if the load
+    // returned garbage rather than 0, disproven WOULD latch, we would get one DISPROVEN
+    // line and no storm. We observe a storm, therefore it reads 0.) The guard added to
+    // survive one failure mode is what makes this one permanent.
+    //
+    // So validate the POINTER before dereferencing it, not just the value it yields.
+    // EE RAM is 32 MB; menu objects live around 0x01c.....; anything outside that, or
+    // unaligned, is not an object. This range also rejects the 382d8d08 of s216-C.
+    if (!HJ_PLAUSIBLE_EE_PTR((u32)stg) || !HJ_PLAUSIBLE_EE_PTR((u32)det)) {
+        // Log once per DISTINCT pair, not once ever. A once-ever line cannot tell
+        // "caught one bad pointer during a teardown" from "rejecting every frame so the
+        // hook never installs at all" -- and those have opposite meanings while looking
+        // identical from outside. Bounded, so it cannot become the storm it replaces.
+        static u32 lastS = 1, lastD = 1;
+        static int pairs = 0;
+        if (((u32)stg != lastS || (u32)det != lastD) && pairs < 8) {
+            lastS = (u32)stg; lastD = (u32)det; ++pairs;
+            HOTJOIN_LOG("uihook: implausible menu ptr stg=%08x det=%08x -- skipping "
+                        "(s237 #%d; would have faulted at +0x60)\n",
+                        (u32)stg, (u32)det, pairs);
+        }
+        return;
+    }
 
     svt = *(u32*)((u32)stg + 0x60);
     dvt = *(u32*)((u32)det + 0x60);
@@ -5941,10 +6087,27 @@ int patchStaging(UiMenu_t* ui, int pad)
     int j;
     GameSettings* gs = gameGetSettings();
     int clientId = gameGetMyClientId();
-    int isTeams = gameGetOptions()->GameFlags.MultiplayerGameFlags.Teams;
-    int itemSelected = *(int*)((u32)ui + 0x290);
-    int isLoading = *(u8*)((u32)ui + 0x2b6);
-    int isRequstingTeamChange = *(u8*)((u32)ui + 0x2c8);
+    int isTeams, itemSelected, isLoading, isRequstingTeamChange;
+
+    // s236: do not dereference before checking. This prologue read four pointers
+    // unguarded -- gameGetOptions()'s return and three fields of `ui` -- with no NULL
+    // test anywhere in the function. s212 already records staging faulting at 0x6BF470
+    // on a NULL gs, so the hazard is not hypothetical.
+    //
+    // Falls through to the original handler rather than returning, so staging keeps
+    // working; stagingFunc is already the pass-through at the end of this function.
+    //
+    // Honesty about scope: this is HARDENING, not a fix for a reproduced fault. The TLB
+    // storm s236 was written around turned out to come from hjInstallGameDetailsHook
+    // (s237, confirmed on hardware), not from here -- patch symbols move between builds
+    // and the pc attribution was off. No patchStaging fault has ever been observed.
+    if (!gs || !ui || !gameGetOptions())
+        return stagingFunc(ui, pad);
+
+    isTeams = gameGetOptions()->GameFlags.MultiplayerGameFlags.Teams;
+    itemSelected = *(int*)((u32)ui + 0x290);
+    isLoading = *(u8*)((u32)ui + 0x2b6);
+    isRequstingTeamChange = *(u8*)((u32)ui + 0x2c8);
 
     // s210-C: there is NO staging fallback, and there should not be one.
     //
