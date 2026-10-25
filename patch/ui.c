@@ -162,7 +162,7 @@ extern mapOverrideResponse;
 // Bump by hand for any build handed to a tester, and identify rounds by this string. An md5
 // still identifies a build on the SERVER machine, where the file exists and the bind mount
 // can be verified; the tag is the only identifier available on a client.
-#define HJ_BUILD_TAG   "20261021d-stagingguard"
+#define HJ_BUILD_TAG   "20261024a-deleteguard"
 
 // ---------------------------------------------------------------------------
 // Hotjoin: guard the per-player registration that faults for a late joiner.
@@ -1630,8 +1630,65 @@ void hjReleaseRemoteSlot(int cid, GameSettings * gs, const char * why)
         (int)*(short*)(nwp + HJ_NW_SPAWNED), (int)*(short*)(nwp + HJ_NW_CBCALLED),
         *(int*)(nwp + HJ_NW_SEQ));
 
-    if (*(short*)(nwp + HJ_NW_CBCALLED))
-        internal_hjDeleteRemotePlayer((void*)nwp);
+    // s263. GUARD THE DELETE, NOT THE ELIGIBILITY.
+    //
+    // s258 widened hjPeerClosedRemote's gate so this function finally runs on a departure
+    // (pData is already 0 by then, so the old `spawned && pData` test never fired). That
+    // fixed the silent split -- and it also means this delete now runs in cases it never
+    // ran in before, specifically with pData ALREADY ZERO. The old eligibility test was
+    // accidentally doing double duty as a precondition for the delete invoker.
+    //
+    // Two of three machines then hung on 20261023a-splitfix, both of them hosts, with
+    // NULL+small-offset faults (addr=0x17b, 0xc, 0x4) at PCs OUTSIDE our address range.
+    // I first read "not our PC" as exculpatory. It is not: a faulting instruction in
+    // vanilla code says nothing about who zeroed the pointer it dereferenced, and this
+    // function zeroes a great deal -- nwp+pData, nwp+seq, every gs->Player* entry for the
+    // slot -- besides invoking 0x199a40. Patch code clearing state that vanilla code still
+    // expects produces precisely a NULL-base fault at a vanilla PC. TLB misses are not
+    // observed on this title outside the patch, and the previous build did not do this.
+    //
+    // So require an actual Player object, not merely cbCalled. 0x199a40 exists to tear a
+    // constructed player down; handing it a slot whose net record is already gone is
+    // asking it to walk pointers nobody has set. cbCalled only says the constructor ran
+    // ONCE, which stays true after a teardown -- it is a history bit, not a liveness bit.
+    //
+    // The latch clearing below still happens unconditionally, which is what actually
+    // repairs s254: the rejoin needs hjSpawned/hjAdopted cleared whether or not there was
+    // a body to delete.
+    //
+    // TODO (s263 guard, 2026-10-25): THIS BRANCH HAS NEVER FIRED. Decide to keep or remove
+    // once there is evidence either way -- do not assume it is protecting anything.
+    //
+    // Measured across a full three-client night on 20261024a-deleteguard: `SKIPPING delete`
+    // = 0 on every machine across FIVE departure modes -- non-host observer of a peer
+    // leaving, surviving non-host when the host leaves, the host's own peer-closed path, a
+    // hard client kill (PCSX2 killed outright), and a two-peer host quit. In every one the
+    // Player object still existed, so the delete was permitted exactly as the old code did.
+    //
+    // HOW WE THEORISE IT WOULD BE REACHED, so a future reader can test it rather than guess:
+    // the branch needs cbCalled set with all[cid] already NULL. A double release cannot do
+    // it -- 0x199A40 clears netClientIndex, bSpawned and bCallbackCalled, which is why a
+    // late second peerclose reads `cid=-1 pData=00000000 spawned=0 cbCalled=0` and comes out
+    // `elig=0` (measured: mbp's reaper released slot 0, the real peerclose arrived 34.8 s
+    // later and declined). So the plausible route is the Player object being freed WITHOUT
+    // the delete invoker running -- a level load or engine-side teardown that frees the
+    // player array while leaving our nwp record intact, after which cbCalled is a stale
+    // history bit (it records that the constructor ran once; it is NOT a liveness bit).
+    //
+    // To reproduce deliberately: have a remote spawn, then force a level transition or an
+    // engine teardown that clears the player array, then trigger a departure for that slot
+    // and check for the line. If that cannot be made to happen, the branch is dead code and
+    // should be removed along with the playerGetAll() call it costs per release.
+    {
+        Player ** all = playerGetAll();
+        int haveBody = all && all[cid];
+        if (*(short*)(nwp + HJ_NW_CBCALLED) && haveBody) {
+            internal_hjDeleteRemotePlayer((void*)nwp);
+        } else if (*(short*)(nwp + HJ_NW_CBCALLED)) {
+            HOTJOIN_LOG("release: slot %d SKIPPING delete -- cbCalled set but no Player "
+                "(all=%08x) (s263 guard)\n", cid, (u32)all);
+        }
+    }
 
     hjSpawned &= ~(1 << cid);
     hjAdopted &= ~(1 << cid);
@@ -1726,7 +1783,15 @@ void hjReleaseRemoteSlot(int cid, GameSettings * gs, const char * why)
 // client as fixed until a rejoin against a survivor has actually been observed.
 // ---------------------------------------------------------------------------
 static int hjPeerCloseReleases = 0;
-#define HJ_PEERCLOSE_MAX  (8)
+// s258-B: hjPeerCloseReleases used to be bumped on every peerclose EVENT, eligible or not,
+// and then compared against the cap -- so eight close events of any kind disabled the
+// teardown for the rest of the session. That never showed up while the eligibility test
+// was broken (nothing was being released anyway), but with s258 the path actually fires,
+// and one 2026-10-22 session logged ten releases. Capping on events rather than on the
+// thing being capped is the same error as the p408 budget that burned 40 on one run and
+// then logged nothing for eleven minutes. Count releases for the cap, events for the log.
+static int hjPeerCloseEvents = 0;
+#define HJ_PEERCLOSE_MAX  (32)
 
 void hjPeerClosedRemote(int idx, int t08)
 {
@@ -1745,9 +1810,33 @@ void hjPeerClosedRemote(int idx, int t08)
     pData    = *(u32*)(nwp + HJ_NW_PDATA);
     cbCalled = (int)*(short*)(nwp + HJ_NW_CBCALLED);
 
-    eligible = spawned && pData && idx != gameGetMyClientId();
+    // s258. `spawned && pData` was wrong, and it is the whole silent-split bug.
+    //
+    // The comment above justifies it as "an arriving peer has spawned=0, pData=0; a
+    // departing one has spawned=1 and a live pData". The second half does not hold.
+    // MEASURED on a non-host at a clean departure (2026-10-22, round 2):
+    //     peerclosed: idx=2 ... pData=00000000 spawned=1 cbCalled=1 seq=171 elig=0
+    // pData is ALREADY zero by the time this hook runs, so the test fails on exactly the
+    // departure it was written to catch, every time. The non-host teardown therefore
+    // never fired, hjSpawned was never cleared, and hjHostSpawnRemotes skipped the slot
+    // forever at the rejoin -- the departed player was invisible on that client for the
+    // rest of the match, with a correct roster and a correct name. Controlled on one
+    // machine in one session: the slot whose latch was clear stranded, a slot whose latch
+    // was set recovered 3/3.
+    //
+    // The discriminator the comment actually wants is "has a player been CONSTRUCTED for
+    // this slot on THIS machine", and we hold that directly: hjSpawned is set by
+    // hjHostSpawnRemotes, which is deliberately NOT host-gated, so it is set on every
+    // machine that built the remote. cbCalled is the engine's own equivalent.
+    //
+    // Still safe against the arriving-peer teardown that this file has got wrong three
+    // times: an arriving peer has hjSpawned clear AND cbCalled 0 AND pData 0, so it is
+    // ineligible until something has actually built it.
+    eligible = (idx != gameGetMyClientId())
+               && spawned
+               && (pData || cbCalled || (hjSpawned & (1 << idx)));
 
-    ++hjPeerCloseReleases;
+    ++hjPeerCloseEvents;
     HOTJOIN_LOG("peerclosed: idx=%d t08=%d host=%d p404=%d myCid=%d "
         "nwp[%d] cid=%d pData=%08x spawned=%d cbCalled=%d seq=%d "
         "roster=[%d,%d,%d,%d] n=%d elig=%d ev=%d\n",
@@ -1759,10 +1848,12 @@ void hjPeerClosedRemote(int idx, int t08)
         gs ? gs->PlayerClients[0] : -9, gs ? gs->PlayerClients[1] : -9,
         gs ? gs->PlayerClients[2] : -9, gs ? gs->PlayerClients[3] : -9,
         gs ? gs->PlayerCount : -9,
-        eligible, hjPeerCloseReleases);
+        eligible, hjPeerCloseEvents);
 
     if (!eligible)
         return;
+
+    ++hjPeerCloseReleases;
 
     // Safety valve. An unbounded teardown is how this file once produced a destroy/recreate
     // cycle against a live player. Eight is far more leaves than a test round needs and
@@ -2772,9 +2863,42 @@ void hjSendMyName(void)
 
     // Repeat rather than send once: the host may not have adopted the slot yet, and
     // a single lost message would leave the name blank for the whole match.
-    netSendCustomAppMessage(conn, gameGetHostId(), CUSTOM_MSG_ID_HOTJOIN_NAME,
-        sizeof(msg), &msg);
-    ++hjNameSends;
+    // s257. Addressing this to gameGetHostId() ALONE sent it to the wrong machine.
+    //
+    // gameGetHostId() is sessionMasterClientIndex (+0x17c). MEASURED on the wire
+    // (2026-10-22, horizon-server trace), a joiner at clientId 2 sending its name:
+    //     TCP RECV (clientId:2) RT_MSG_CLIENT_APP_SINGLE TargetOrSource:1
+    //         Payload:00-08-...-6D-61-78-54-65-73-74-32      ("maxTest2")
+    //     SEND  -> 192.168.1.32   TargetOrSource:2            (the OTHER joiner)
+    // The server routed it exactly as addressed. Nothing was dropped and no handler ate
+    // it -- the joiner believed client 1 was the host. The real host's whole-log
+    // `grep -c "HJ name: slot 2"` found only the vacancy scrub, so its resolution line
+    // never fired once, and the user saw a BLANK NAME on a first join.
+    //
+    // Note this also falsifies the s208-E comment on hjSendTeamPref, which justifies its
+    // direct-to-host send as "exactly what the name sync does and that one is known to
+    // arrive". It arrives -- somewhere.
+    //
+    // So broadcast as well, which does not depend on knowing who the host is. Keeping the
+    // direct send too: s208-E's reasoning still holds that the DME may relay the two paths
+    // differently for a client that has just hot-joined, and the broadcast alone is an
+    // untested assumption. hjOnRemoteName is deliberately NOT host-gated and stays that
+    // way -- it only writes gs->PlayerNames[idx], validates printability, and is
+    // idempotent, so every client ending up with correct names is the better outcome.
+    {
+        int host = gameGetHostId();
+        int rcB  = netBroadcastCustomAppMessage(conn, CUSTOM_MSG_ID_HOTJOIN_NAME,
+                                                sizeof(msg), &msg);
+        int rcS  = netSendCustomAppMessage(conn, host, CUSTOM_MSG_ID_HOTJOIN_NAME,
+                                           sizeof(msg), &msg);
+        ++hjNameSends;
+        // Log the target: if host != 0 here, s257 is live on this machine, and that is
+        // the one number that says so.
+        if (hjNameSends <= 4) {
+            HOTJOIN_LOG("name SENT %d: me=%d host=%d (smaster) rcB=%d rcS=%d\n",
+                hjNameSends, me, host, rcB, rcS);
+        }
+    }
 }
 
 void hjInstallNameHandler(void)
