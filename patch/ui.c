@@ -162,7 +162,7 @@ extern mapOverrideResponse;
 // Bump by hand for any build handed to a tester, and identify rounds by this string. An md5
 // still identifies a build on the SERVER machine, where the file exists and the bind mount
 // can be verified; the tag is the only identifier available on a client.
-#define HJ_BUILD_TAG   "20261024a-deleteguard"
+#define HJ_BUILD_TAG   "20261027a-teamgate"
 
 // ---------------------------------------------------------------------------
 // Hotjoin: guard the per-player registration that faults for a late joiner.
@@ -1528,6 +1528,10 @@ static int hjRosterBeat = 0;
 // Cleared on the menus edge -- and, since section 63, by the reaper, because an in-game
 // host NEVER returns to menus. A stale bit here silently disables every repair below it.
 int hjSpawned = 0;
+
+// s270: host-ness a false promotion cannot forge. Defined beside hjHostReapRemotes,
+// declared here because hjHostAdoptPeers and hjHostRefreshNames both gate on it.
+int hjAmHostTrusted(void);
 int hjAdopted = 0;                 // bitmask of slots we have already written
 
 // The tNW_Player array, needed here as well as further down. Identical redefinition
@@ -2368,7 +2372,15 @@ void hjHostAdoptPeers(void)
         if (gs->PlayerClients[i] >= 0)
             ++count;
 
-    if (!gameAmIHost()) {
+    // s270-G: hjAmHostTrusted(), not gameAmIHost(). MEASURED 2026-10-25: a falsely promoted
+    // client ran THIS path and wrote its own roster as host --
+    //     adopt: slot 2 team -> 1 (s206 auto-assign)
+    //     adopt: host wrote roster slot 2 (client 2, state 8), n -> 3
+    // auto-assigning a team on a machine that is not the host. The real host happened to
+    // agree on team 1 that time, so no split was observed -- harmless, not safe.
+    // A refused client correctly falls into the non-host branch below, which only repairs
+    // its own PlayerCount, so this is a narrowing rather than a behaviour change.
+    if (!hjAmHostTrusted()) {
         if (count > 0 && gs->PlayerCount != count) {
             HOTJOIN_LOG("adopt: joiner PlayerCount %d -> %d\n", gs->PlayerCount, count);
             gs->PlayerCount = count;
@@ -2619,7 +2631,9 @@ void hjHostRefreshNames(void)
     GameSettings * gs;
     int i, me;
 
-    if (isInMenus() || !isInGame() || !gameAmIHost())
+    // s270-G: see hjHostAdoptPeers. A falsely promoted client also ran the vacancy scrub
+    // from here (`name: slot N vacant`), which is another host-only write.
+    if (isInMenus() || !isInGame() || !hjAmHostTrusted())
         return;
 
     gs = gameGetSettings();
@@ -3305,6 +3319,78 @@ void hjDumpPadRing(void)
 
 extern int hjAdopted;
 
+// ---------------------------------------------------------------------------
+// s270: host-ness that a false promotion cannot forge.
+//
+// WHY. gameAmIHost() is myClientIndex == sessionMasterClientIndex (libuya/src/game.c:191),
+// and the engine's cb30 callback (0x00197550, from ra=0x001729a8) PROMOTES a remaining
+// non-host at a departure -- measured, and the trigger is now known exactly:
+//
+//     the promotion fires iff EXACTLY ONE non-host remains after the departure
+//
+// Confirmed by prediction 2026-10-25: x left a two-client hostless match, mbp became the
+// only client, and cb30 fired with ev4=1 (its own cid), f16c=1. It fires on every machine
+// (three so far) and persists -- sessionMasterClientIndex survives the match teardown AND
+// the menus, and is only overwritten when the next join stages.
+//
+// WHAT IT COSTS. Every `if (gameAmIHost())` gate in this file then runs on a client that is
+// not the host. That is not cosmetic: a falsely promoted mbp ran the host-only REAPER and
+// DELETED THE REAL HOST'S PLAYER after a 900-frame pad stall, 34.8 s before the host's own
+// peerclose arrived. It also wrote its own roster slot via the host adopt path.
+//
+// WHY NOT JUST CACHE "am I host" AT MATCH START. Because a host departure can legitimately
+// leave a survivor as master, and a plain cache would refuse that forever. So latch the
+// HOST'S CID at match start and trust a promotion only when that client is actually gone
+// from the roster. Legitimate migration still works; a promotion invented while the real
+// host is still sitting in the roster does not.
+//
+// NOT gated on isSessionMaster (+0x178) either: cb30 sets that too (f168=1 in every
+// capture), so it is corrupt in exactly the same cases.
+// ---------------------------------------------------------------------------
+static int hjHostCidAtStart = -1;      // -1 = not latched for this match
+static int hjHostRefusals = 0;
+
+int hjAmHostTrusted(void)
+{
+    GameSettings * gs = gameGetSettings();
+    int me;
+
+    if (isInMenus() || !isInGame() || !gs) {
+        hjHostCidAtStart = -1;         // re-latch on the next match
+        return 0;
+    }
+
+    // Latch on the first in-game frame. Safe to read here: x's sampler showed
+    // sessionMasterClientIndex is reset at GAME_DETAILS/staging of the join, so it is
+    // correct by the time we are in game -- and main() calls this every frame, long
+    // before any departure can occur.
+    if (hjHostCidAtStart < 0) {
+        hjHostCidAtStart = gameGetHostId();
+        HOTJOIN_LOG("s270: latched host cid %d at match start (myCid=%d)\n",
+            hjHostCidAtStart, gameGetMyClientId());
+    }
+
+    if (!gameAmIHost())
+        return 0;
+
+    me = gameGetMyClientId();
+    if (hjHostCidAtStart == me)
+        return 1;                      // we were the host all along
+
+    if (hjHostCidAtStart >= 0 && hjHostCidAtStart < GAME_MAX_PLAYERS
+        && gs->PlayerClients[hjHostCidAtStart] < 0)
+        return 1;                      // the original host really has gone
+
+    if (hjHostRefusals < 8) {
+        ++hjHostRefusals;
+        HOTJOIN_LOG("s270: REFUSING host role -- gameAmIHost()=1 but latched host cid %d "
+            "is STILL in the roster (myCid=%d, clients[%d]=%d)\n",
+            hjHostCidAtStart, me, hjHostCidAtStart,
+            gs->PlayerClients[hjHostCidAtStart]);
+    }
+    return 0;
+}
+
 void hjHostReapRemotes(void)
 {
     GameSettings * gs = gameGetSettings();
@@ -3338,7 +3424,11 @@ void hjHostReapRemotes(void)
     // If it freezes at menu-open, a player sitting in the pause menu is reaped -- at 15 s
     // now, at 8 s in every build before today. Do not add an in-game-menu gate on the
     // strength of the guess; measure the seq first.
-    if (!gameAmIHost() || !isInGame() || isInMenus())
+    // s270: hjAmHostTrusted(), not gameAmIHost(). This is the gate that did real damage
+    // -- a falsely promoted client reaped the REAL host's player at the 900-frame
+    // threshold, 34.8 s before that host's own peerclose arrived. This call also performs
+    // the match-start latch, and main() calls this function every frame.
+    if (!hjAmHostTrusted() || !isInGame() || isInMenus())
         return;
 
     for (i = 0; i < HJ_NWP_SLOTS; ++i) {
@@ -4209,6 +4299,11 @@ void hjLogEpochTock(void)
     // state 5. Sections 63, 78 and 80 are the same mistake: a probe's own gating read
     // as a property of the game. Every counter in this file belongs in this function.
     hjP408Held = 0;
+    // s270-H: FIFTH instance of the lifetime-cap mistake this function exists to prevent.
+    // hjHostRefusals capped at 8 for the process, so a count stopping at 8 meant "budget
+    // spent", not "refusals stopped" -- and it made check 3's accept branch UNMEASURABLE,
+    // because a refusal could no longer print. With it reset per epoch, silence is evidence.
+    hjHostRefusals = 0;
     // The player-array dump had the same one-shot cap as the others, and it cost us a
     // measurement: on the host it fired ONCE at 217.7s, six seconds BEFORE the roster
     // adopt at 223.98s, so the run that finally produced a matching roster on both
@@ -6045,25 +6140,8 @@ void openTeamsOptions(GameSettings * gs, int isTeams)
 // into executable dispatch.
 static int (*hjOrigGameDetailsUpdate)(UiMenu_t*, int) = 0;
 
-int patchGameDetails(UiMenu_t* ui, int pad)
-{
-    if (!hjTeamPromptAsked) {
-        int sel;
-        hjTeamPromptAsked = 1;
-        HOTJOIN_LOG("teamsel: raising prompt from GAME DETAILS\n");
-        sel = uiShowSelectDialog("Join Team", hjTeamChoiceOptions, 3, 0);
-        hjTeamChoice = (sel <= 0) ? -1 : (sel - 1);
-        HOTJOIN_LOG("teamsel: choice -> %d (%s), raw sel %d\n", hjTeamChoice,
-            (hjTeamChoice < 0) ? "auto" : ((hjTeamChoice == 0) ? "blue" : "red"), sel);
-    }
-
-    if (hjOrigGameDetailsUpdate)
-        return hjOrigGameDetailsUpdate(ui, pad);
-    return 0;
-}
-
 // s237: a pointer we are about to dereference must be inside EE RAM and aligned.
-// uiGetMenu() returning non-NULL is NOT sufficient -- see the note in the function below.
+// uiGetMenu() returning non-NULL is NOT sufficient -- see the note in hjInstallGameDetailsHook.
 // Mask off the segment bits first: the EE reaches the same 32 MB through cached
 // (0x00......), uncached (0x20......) and uncached-accelerated (0x30......) mirrors,
 // and a legitimate object can be handed to us through any of them. Testing the raw
@@ -6077,6 +6155,110 @@ int patchGameDetails(UiMenu_t* ui, int pad)
 #define HJ_PLAUSIBLE_EE_PTR(p)  ((((u32)(p)) & 0x0FFFFFFFu) >= 0x00100000u \
                                  && (((u32)(p)) & 0x0FFFFFFFu) < 0x02000000u \
                                  && ((((u32)(p)) & 3u) == 0u))
+
+// ---------------------------------------------------------------------------
+// s291: raise the team prompt ONLY for a game that is already in progress.
+//
+// USER-REPORTED (s273): the prompt fired on GAME DETAILS of a STAGING game, where it has no
+// business -- a staging join gets the staging screen and picks a team there. The prompt exists
+// because a HOT-JOIN skips that screen.
+//
+// The obvious gate -- MediusWorldStatus -- IS NOT AVAILABLE, and the reason matters: OUR OWN
+// SERVER falsifies it. Server.Medius/Medius/MLS.cs, commit 75a82a9, four sites:
+//     WorldStatus = x.WorldStatus == WorldActive ? MediusWorldStatus.WorldStaging : x.WorldStatus
+// so every active world is reported to the client as WorldStaging. Measured on a running client
+// (s282): the field reads 1 in staging AND 1 with the match live. That falsification is also why
+// the "[IG] " name prefix exists at all -- it is the only in-game signal we deliberately left in
+// the list response, which is why checking the name is not the lazy option the user took it for.
+//
+// What IS available, measured two ways (s291):
+//   * the SELECTED game's worldId, at GAME_DETAILS + 0x2A8. Not a pointer to the entry and not a
+//     row index -- neither exists anywhere in the CITY or DETAILS menu objects, and CITY is
+//     byte-identical between two different selections.
+//   * PlayerSkillLevel bit 0x08000000, set by the GAME ITSELF when the match goes live. The
+//     server passes PlayerSkillLevel through untouched. SET on 6/6 copies of a live world and
+//     CLEAR on 6/6 copies of a staging world IN THE SAME DUMP, so neither staleness nor machine
+//     identity can explain it.
+// Both addresses confirmed on TWO machines (maxTest2 and maxMac3), at identical addresses --
+// GAME_DETAILS is 0x01D40578 on both -- so they are static, not per-machine.
+//
+// WHY THE SCAN IS BY worldId AND WHY IT ORs: the entry array is NOT a stable mirror of the
+// visible rows. Two dumps seconds apart held two copies of each world in DIFFERENT orders, so
+// `base + idx*stride` would be wrong INTERMITTENTLY. And one copy was observed partially written
+// (skill word reading 0x00000000), while a removed world's slot can hold a stale copy. A stale or
+// half-written CLEAR copy must not be allowed to veto, so take the OR across every match. The set
+// bit only ever appeared on a live world, so OR is safe in the direction that matters.
+//
+// FAIL OPEN. If the worldId is implausible or no entry matches, return -1 and raise the prompt
+// anyway. Suppressing it wrongly loses the team choice on a real hot-join SILENTLY; raising it
+// wrongly costs one dialog. The log line says which happened.
+#define HJ_DETAILS_SEL_WID_OFF  (0x2A8)
+#define HJ_GAMELIST_BASE        (0x01BE9648)   /* entry 0; name sits at entry+52 */
+#define HJ_GAMELIST_STRIDE      (0x194)
+#define HJ_GL_WID_OFF           (0x04)         /* = name-48 */
+#define HJ_GL_SKILL_OFF         (0x14)         /* = name-32, PlayerSkillLevel */
+#define HJ_GL_INPROGRESS_BIT    (0x08000000)
+#define HJ_GAMELIST_LO          (-4)           /* scan below the measured base too: its true */
+#define HJ_GAMELIST_HI          (12)           /* extent is unknown, the reads are static RAM */
+
+static int hjSelectedGameInProgress(UiMenu_t * ui)
+{
+    u32 wid;
+    int i, found = 0, flag = 0;
+
+    if (!ui || !HJ_PLAUSIBLE_EE_PTR(ui))
+        return -1;
+
+    wid = *(u32*)((u32)ui + HJ_DETAILS_SEL_WID_OFF);
+    if (wid == 0 || wid > 0xFFFF)
+        return -1;                             /* not a world id */
+
+    for (i = HJ_GAMELIST_LO; i < HJ_GAMELIST_HI; ++i) {
+        u32 e = (u32)(HJ_GAMELIST_BASE + (i * HJ_GAMELIST_STRIDE));
+        if (!HJ_PLAUSIBLE_EE_PTR(e))
+            continue;
+        if (*(u32*)(e + HJ_GL_WID_OFF) != wid)
+            continue;
+        ++found;
+        if (*(u32*)(e + HJ_GL_SKILL_OFF) & HJ_GL_INPROGRESS_BIT)
+            flag = 1;                          /* OR across copies, never first-hit */
+    }
+
+    if (!found)
+        return -1;
+    return flag;
+}
+
+int patchGameDetails(UiMenu_t* ui, int pad)
+{
+    if (!hjTeamPromptAsked) {
+        int sel;
+        int inprog = hjSelectedGameInProgress(ui);
+        hjTeamPromptAsked = 1;
+
+        if (inprog == 0) {
+            HOTJOIN_LOG("teamsel: SUPPRESSED -- selected game is STAGING, not in progress "
+                "(wid=%d) (s291)\n", (int)*(u32*)((u32)ui + HJ_DETAILS_SEL_WID_OFF));
+            if (hjOrigGameDetailsUpdate)
+                return hjOrigGameDetailsUpdate(ui, pad);
+            return 0;
+        }
+        if (inprog < 0)
+            HOTJOIN_LOG("teamsel: in-progress UNKNOWN (no list entry matched) -- prompting "
+                "anyway, fail-open (s291)\n");
+
+        HOTJOIN_LOG("teamsel: raising prompt from GAME DETAILS (inprog=%d)\n", inprog);
+        sel = uiShowSelectDialog("Join Team", hjTeamChoiceOptions, 3, 0);
+        hjTeamChoice = (sel <= 0) ? -1 : (sel - 1);
+        HOTJOIN_LOG("teamsel: choice -> %d (%s), raw sel %d\n", hjTeamChoice,
+            (hjTeamChoice < 0) ? "auto" : ((hjTeamChoice == 0) ? "blue" : "red"), sel);
+    }
+
+    if (hjOrigGameDetailsUpdate)
+        return hjOrigGameDetailsUpdate(ui, pad);
+    return 0;
+}
+
 
 void hjInstallGameDetailsHook(u32 stagingUpdateSlot)
 {
