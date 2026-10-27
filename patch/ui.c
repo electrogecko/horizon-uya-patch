@@ -162,7 +162,7 @@ extern mapOverrideResponse;
 // Bump by hand for any build handed to a tester, and identify rounds by this string. An md5
 // still identifies a build on the SERVER machine, where the file exists and the bind mount
 // can be verified; the tag is the only identifier available on a client.
-#define HJ_BUILD_TAG   "20261027a-teamgate"
+#define HJ_BUILD_TAG   "20261027b-teampref"
 
 // ---------------------------------------------------------------------------
 // Hotjoin: guard the per-player registration that faults for a late joiner.
@@ -1534,6 +1534,26 @@ int hjSpawned = 0;
 int hjAmHostTrusted(void);
 int hjAdopted = 0;                 // bitmask of slots we have already written
 
+// s294: the joiner's requested team, per slot, as received by the HOST.
+//
+// Declared up here rather than with the s207/s208 block because the RELEASE path has to
+// clear it, and that runs several hundred lines earlier. HJ_TEAMPREF_NONE (-1) is Auto,
+// which is also "nothing requested" -- Auto never sends, so the two are the same state.
+//
+// WHY THE CLEAR MATTERS, measured 2026-10-27: nothing ever cleared this. The only write of
+// NONE was in hjTeamPrefEnsureInit, which runs ONCE per process, so a slot kept the
+// departed player's pick indefinitely and the next occupant inherited it. Caught on a live
+// match -- a joiner who picked RED was adopted onto team 0:
+//     [2293.9165] teampref: honouring client 1 request for team 0   <- STALE, from the
+//     [2293.9167] adopt: slot 1 team -> 0 (client preference)          previous occupant
+//     [2294.0186] teampref: client 1 wants team 1                   <- what was ACTUALLY sent
+//     [2294.0332] teampref: LATE apply, slot 1 team 0 -> 1
+// A joiner picking AUTO into that slot gets no correcting message at all, so it would have
+// been silently forced onto the departed player's team with nothing in the log to say so.
+// Same defect class as the stale name on slot reuse (s224).
+#define HJ_TEAMPREF_NONE   (-1)
+static int hjPeerTeamPref[GAME_MAX_PLAYERS];
+
 // The tNW_Player array, needed here as well as further down. Identical redefinition
 // is legal C; the authoritative comments on these live with hjDumpNWPlayers.
 #define HJ_NWPLAYER_BASE   (0x0022F550)
@@ -1697,6 +1717,17 @@ void hjReleaseRemoteSlot(int cid, GameSettings * gs, const char * why)
     hjSpawned &= ~(1 << cid);
     hjAdopted &= ~(1 << cid);
 
+    // s294: the slot is vacated, so the departed player's team request dies with it.
+    // Deliberately cleared on the DEPARTURE EVENT and not from a "is the slot vacant"
+    // sweep: a preference legitimately arrives BEFORE adopt writes gs->PlayerClients[cid]
+    // (measured at 82 ms ahead), so a vacancy test would clear a live request inside that
+    // window -- breaking the very case it was meant to protect.
+    if (hjPeerTeamPref[cid] != HJ_TEAMPREF_NONE) {
+        HOTJOIN_LOG("teampref: slot %d released, clearing pref %d (s294)\n",
+            cid, hjPeerTeamPref[cid]);
+        hjPeerTeamPref[cid] = HJ_TEAMPREF_NONE;
+    }
+
     hjReapBlocked |= (1 << cid);
     hjReapBlockFrames[cid] = 0;
     hjSpawnBlocked |= (1 << cid);
@@ -1854,8 +1885,27 @@ void hjPeerClosedRemote(int idx, int t08)
         gs ? gs->PlayerCount : -9,
         eligible, hjPeerCloseEvents);
 
-    if (!eligible)
+    if (!eligible) {
+        // s284/s294: the engine's own disconnect path can beat us to the slot and zero the
+        // nwp record, in which case the eligibility test above correctly finds nothing to
+        // tear down (measured 2 of 8 departures). s286 proved the engine does the whole job
+        // -- it NULLs the player table slot and pMoby and destroys the moby -- so this is
+        // NOT a leak. But hjReleaseRemoteSlot never runs on that path, so OUR per-slot state
+        // is left claiming a player we built, and the team preference is left for the next
+        // occupant to inherit.
+        //
+        // The detection is unambiguous: the whole net record is zero AND we hold a bit saying
+        // we built this slot. A live slot has at least one of pData/spawned/cbCalled set
+        // (the same discriminator s258 relies on), and an ARRIVING peer has hjSpawned clear.
+        if (!spawned && !cbCalled && !pData && (hjSpawned & (1 << idx))) {
+            HOTJOIN_LOG("peerclosed: idx=%d ENGINE-CLEARED -- nwp zeroed before our hook; "
+                "clearing latches and pref %d (s284)\n", idx, hjPeerTeamPref[idx]);
+            hjSpawned &= ~(1 << idx);
+            hjAdopted &= ~(1 << idx);
+            hjPeerTeamPref[idx] = HJ_TEAMPREF_NONE;
+        }
         return;
+    }
 
     ++hjPeerCloseReleases;
 
@@ -1887,10 +1937,8 @@ void hjPeerClosedRemote(int idx, int t08)
 //
 // This uses the patch's existing client-to-client custom message facility (the same one
 // vote-to-end and playersync use), so no server change is needed.
-#define HJ_TEAMPREF_NONE   (-1)
 extern PatchConfig_t config;      // defined in main.c
 extern int hjTeamChoice;          // defined just below, in the s207 block
-static int hjPeerTeamPref[GAME_MAX_PLAYERS];
 static int hjTeamPrefInit = 0;
 static int hjTeamPrefSendTick = 0;
 // s209-D: the ONE place the joiner's wanted team is resolved. -1 = Auto.
@@ -1995,10 +2043,18 @@ void hjSendTeamPref(void)
     {
         static int wasInGame = 0;
         int nowInGame = isInGame();
-        if (nowInGame && !wasInGame) {
+        // s293: rearm on BOTH edges, not just the one into the game. Rearming only on entry
+        // meant the PRE-GAME send budget was spent by the first join of a process and never
+        // came back, so every later join had no pre-game SENT lines at all -- and that
+        // absence reads exactly like a late send. It cost a wrong hypothesis: three joins
+        // looked as though their preference was sent ~15 s later than the first one's, when
+        // in fact only the log was missing. The first genuine send is ~1.3 s after JOIN on
+        // every join measured.
+        if (nowInGame != wasInGame) {
             hjPrefBlockedLogged = 0;
             hjPrefSentLogged    = 0;
-            HOTJOIN_LOG("teampref: entered game, diagnostic budgets rearmed\n");
+            HOTJOIN_LOG("teampref: %s game, diagnostic budgets rearmed\n",
+                nowInGame ? "entered" : "left");
         }
         wasInGame = nowInGame;
     }
@@ -2056,7 +2112,10 @@ void hjHostApplyLateTeamPref(void)
     GameSettings * gs;
     int i;
 
-    if (!gameAmIHost() || !isInGame())
+    // s270: hjAmHostTrusted(), not gameAmIHost(). s270 converted three gates and missed
+    // this one. A falsely promoted client would rewrite EVERY occupied slot's team from its
+    // own preference table -- milder than reaping a live player, but the same bug class.
+    if (!hjAmHostTrusted() || !isInGame())
         return;
     hjTeamPrefEnsureInit();
 
@@ -3349,6 +3408,11 @@ extern int hjAdopted;
 // ---------------------------------------------------------------------------
 static int hjHostCidAtStart = -1;      // -1 = not latched for this match
 static int hjHostRefusals = 0;
+// s280: ONE accept line per match. This gate logged only REFUSALS, so an accept was
+// indistinguishable in the log from the gate never being consulted -- mbp held the
+// "vacated" branch for 3 h 20 m and could not tell which it had. Second time this gate's
+// accepting side was built unobservable; s271's lifetime cap was the first.
+static int hjHostAcceptLogged = 0;
 
 int hjAmHostTrusted(void)
 {
@@ -3357,6 +3421,7 @@ int hjAmHostTrusted(void)
 
     if (isInMenus() || !isInGame() || !gs) {
         hjHostCidAtStart = -1;         // re-latch on the next match
+        hjHostAcceptLogged = 0;        // s280: and re-arm the accept line
         return 0;
     }
 
@@ -3374,12 +3439,24 @@ int hjAmHostTrusted(void)
         return 0;
 
     me = gameGetMyClientId();
-    if (hjHostCidAtStart == me)
+    if (hjHostCidAtStart == me) {
+        if (!hjHostAcceptLogged) {
+            hjHostAcceptLogged = 1;
+            HOTJOIN_LOG("s270: host role ACCEPTED (self -- I was host at match start, "
+                "cid %d)\n", me);
+        }
         return 1;                      // we were the host all along
+    }
 
     if (hjHostCidAtStart >= 0 && hjHostCidAtStart < GAME_MAX_PLAYERS
-        && gs->PlayerClients[hjHostCidAtStart] < 0)
+        && gs->PlayerClients[hjHostCidAtStart] < 0) {
+        if (!hjHostAcceptLogged) {
+            hjHostAcceptLogged = 1;
+            HOTJOIN_LOG("s270: host role ACCEPTED (vacated -- latched host cid %d has left "
+                "the roster, myCid=%d)\n", hjHostCidAtStart, me);
+        }
         return 1;                      // the original host really has gone
+    }
 
     if (hjHostRefusals < 8) {
         ++hjHostRefusals;
